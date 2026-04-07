@@ -44,6 +44,38 @@ impl SidebarLayoutMode {
     }
 }
 
+/// Sidebar filter mode: show all agents or only those matching the host's project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SidebarFilterMode {
+    #[default]
+    None,
+    Project,
+}
+
+impl SidebarFilterMode {
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::None => Self::Project,
+            Self::Project => Self::None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Project => "project",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "project" => Self::Project,
+            _ => Self::None,
+        }
+    }
+}
+
 /// Whether the sidebar auto-follows its host window or the user is navigating manually.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectionMode {
@@ -223,6 +255,10 @@ pub struct SidebarApp {
     /// Deadline after which pending resize should be processed.
     pub(super) resize_deadline: Option<Instant>,
     suppress_resize_once: bool,
+    /// Filter mode: show all agents or only those matching the host's project.
+    pub filter_mode: SidebarFilterMode,
+    /// Working directory of the host pane for project detection.
+    host_pane_cwd: Option<PathBuf>,
 }
 
 impl SidebarApp {
@@ -278,6 +314,8 @@ impl SidebarApp {
             pending_resize_rows: None,
             resize_deadline: None,
             suppress_resize_once: false,
+            filter_mode: SidebarFilterMode::default(),
+            host_pane_cwd: None,
         }
     }
 
@@ -297,6 +335,7 @@ impl SidebarApp {
         let status_icons = config.status_icons.clone();
 
         let (host_session, host_window_id) = detect_host_window();
+        let host_pane_cwd = detect_host_pane_cwd();
 
         let (templates, template_error) = parse_templates(&config);
         let (current_compact_str, current_tile_strs, current_horizontal_strs) =
@@ -354,6 +393,8 @@ impl SidebarApp {
             pending_resize_rows: None,
             resize_deadline: None,
             suppress_resize_once: false,
+            filter_mode: SidebarFilterMode::default(),
+            host_pane_cwd,
         })
     }
 
@@ -385,6 +426,7 @@ impl SidebarApp {
 
         self.position = snapshot.position;
         self.layout_mode = snapshot.layout_mode;
+        self.filter_mode = snapshot.filter_mode;
         self.git_statuses = snapshot.git_statuses;
         self.pr_statuses = snapshot.pr_statuses;
         self.interrupted_pane_ids = snapshot.interrupted_pane_ids;
@@ -414,6 +456,19 @@ impl SidebarApp {
             .map(|a| a.pane_id.clone());
 
         self.agents = snapshot.agents;
+
+        // Apply project filter: retain only agents matching the host's project
+        if self.filter_mode == SidebarFilterMode::Project
+            && let Some(host_project) = self.host_project_name()
+        {
+            self.agents
+                .retain(|a| extract_project_name(&a.path) == host_project);
+            // Recompute host_agent_idx after filtering
+            self.host_agent_idx = self
+                .host_window_id
+                .as_ref()
+                .and_then(|wid| self.agents.iter().position(|a| a.window_id == *wid));
+        }
 
         // Restore selection
         if let Some(ref pane_id) = selected_pane {
@@ -701,6 +756,37 @@ impl SidebarApp {
 
         // Signal daemon for immediate refresh (re-sort + broadcast)
         super::daemon_ctrl::signal_daemon();
+    }
+
+    pub fn toggle_filter_mode(&mut self) {
+        self.filter_mode = self.filter_mode.toggle();
+        // Persist to tmux so all sidebar instances pick it up immediately
+        let _ = Cmd::new("tmux")
+            .args(&[
+                "set-option",
+                "-g",
+                "@workmux_sidebar_filter",
+                self.filter_mode.as_str(),
+            ])
+            .run();
+        // Persist to settings.json so it survives tmux restarts
+        if let Ok(store) = crate::state::StateStore::new()
+            && let Ok(mut settings) = store.load_settings()
+        {
+            settings.sidebar_filter = Some(self.filter_mode.as_str().to_string());
+            let _ = store.save_settings(&settings);
+        }
+        // Signal daemon for immediate refresh
+        super::daemon_ctrl::signal_daemon();
+    }
+
+    /// The project name derived from the host window. Prefers the host agent's path,
+    /// falls back to the host pane's working directory for non-agent windows.
+    pub fn host_project_name(&self) -> Option<String> {
+        self.host_agent_idx
+            .and_then(|idx| self.agents.get(idx))
+            .map(|a| extract_project_name(&a.path))
+            .or_else(|| self.host_pane_cwd.as_ref().map(|p| extract_project_name(p)))
     }
 
     pub fn window_prefix(&self) -> &str {
@@ -1325,4 +1411,70 @@ fn detect_host_window() -> (Option<String>, Option<String>) {
     let session = parts.next().flatten();
     let window_id = parts.next().flatten();
     (session, window_id)
+}
+
+/// Detect the working directory of the sidebar's host pane (one-time at startup).
+/// Used as a fallback for project detection when the host window has no agent.
+fn detect_host_pane_cwd() -> Option<PathBuf> {
+    let pane_id = std::env::var("TMUX_PANE").ok()?;
+    let output = Cmd::new("tmux")
+        .args(&[
+            "display-message",
+            "-t",
+            &pane_id,
+            "-p",
+            "#{pane_current_path}",
+        ])
+        .run_and_capture_stdout()
+        .ok()?;
+    let path = output.trim();
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_mode_toggle() {
+        assert_eq!(SidebarFilterMode::None.toggle(), SidebarFilterMode::Project);
+        assert_eq!(SidebarFilterMode::Project.toggle(), SidebarFilterMode::None);
+    }
+
+    #[test]
+    fn filter_mode_roundtrip_strings() {
+        for mode in [SidebarFilterMode::None, SidebarFilterMode::Project] {
+            assert_eq!(SidebarFilterMode::from_str(mode.as_str()), mode);
+        }
+    }
+
+    #[test]
+    fn filter_mode_from_str_defaults_to_all() {
+        assert_eq!(SidebarFilterMode::from_str(""), SidebarFilterMode::None);
+        assert_eq!(
+            SidebarFilterMode::from_str("unknown"),
+            SidebarFilterMode::None
+        );
+    }
+
+    #[test]
+    fn filter_mode_from_str_case_insensitive() {
+        assert_eq!(
+            SidebarFilterMode::from_str("Project"),
+            SidebarFilterMode::Project
+        );
+        assert_eq!(
+            SidebarFilterMode::from_str("PROJECT"),
+            SidebarFilterMode::Project
+        );
+    }
+
+    #[test]
+    fn filter_mode_default_is_all() {
+        assert_eq!(SidebarFilterMode::default(), SidebarFilterMode::None);
+    }
 }
