@@ -161,6 +161,7 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(HOOKS_JSON).expect("embedded hooks config is valid JSON");
         let hooks = parsed.get("hooks").unwrap().as_object().unwrap();
+        assert!(hooks.contains_key("SessionStart"));
         assert!(hooks.contains_key("BeforeAgent"));
         assert!(hooks.contains_key("AfterTool"));
         assert!(hooks.contains_key("AfterAgent"));
@@ -212,6 +213,7 @@ mod tests {
     fn test_load_hooks() {
         let hooks = load_hooks().unwrap();
         let obj = hooks.as_object().unwrap();
+        assert!(obj.contains_key("SessionStart"));
         assert!(obj.contains_key("BeforeAgent"));
         assert!(obj.contains_key("AfterTool"));
         assert!(obj.contains_key("AfterAgent"));
@@ -231,7 +233,7 @@ mod tests {
         }
 
         let hooks = config.get("hooks").unwrap().as_object().unwrap();
-        assert_eq!(hooks.len(), 4);
+        assert_eq!(hooks.len(), 5);
     }
 
     #[test]
@@ -320,6 +322,6 @@ mod tests {
 
         // All 4 events should be present
         let hooks = config.get("hooks").unwrap().as_object().unwrap();
-        assert_eq!(hooks.len(), 4);
+        assert_eq!(hooks.len(), 5);
     }
 }
