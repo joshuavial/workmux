@@ -167,6 +167,10 @@ pub struct GlobalSettings {
     /// Sidebar layout mode: "compact" or "tiles"
     #[serde(default)]
     pub sidebar_layout: Option<String>,
+
+    /// Sidebar filter mode: "all" or "project"
+    #[serde(default)]
+    pub sidebar_filter: Option<String>,
 }
 
 /// Tracks which pane last-done navigated to, so repeated presses cycle

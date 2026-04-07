@@ -429,6 +429,8 @@ fn compute_nav_target(action: &NavAction, current_idx: Option<usize>, len: usize
 }
 
 /// Navigate to an agent by reading the daemon's ordered agent list from tmux.
+/// Respects the sidebar filter mode: when set to "project", only navigates
+/// among agents belonging to the same project as the current pane.
 pub fn navigate(action: NavAction) -> Result<()> {
     if std::env::var("TMUX").is_err() {
         return Err(anyhow!("Sidebar requires tmux"));
@@ -445,7 +447,7 @@ pub fn navigate(action: NavAction) -> Result<()> {
     }
 
     // Parse space-separated pane IDs
-    let panes: Vec<&str> = agents_str.split_whitespace().collect();
+    let mut panes: Vec<&str> = agents_str.split_whitespace().collect();
 
     if panes.is_empty() {
         anyhow::bail!("no sidebar agents found");
@@ -457,6 +459,37 @@ pub fn navigate(action: NavAction) -> Result<()> {
         .run_and_capture_stdout()
         .unwrap_or_default();
     let current_pane_id = current_pane_id.trim();
+
+    // Apply project filter if active
+    let filter_mode = Cmd::new("tmux")
+        .args(&["show-option", "-gqv", "@workmux_sidebar_filter"])
+        .run_and_capture_stdout()
+        .unwrap_or_default();
+    if filter_mode.trim() == "project"
+        && let Ok(store) = crate::state::StateStore::new()
+        && let Ok(agents) = store.list_all_agents()
+    {
+        // Get the current pane's project name
+        let current_project = agents.iter().find_map(|a| {
+            (a.pane_key.pane_id == current_pane_id)
+                .then(|| crate::agent_display::extract_project_name(&a.workdir))
+        });
+
+        if let Some(project) = current_project {
+            // Build set of pane IDs that belong to this project
+            let project_panes: std::collections::HashSet<&str> = agents
+                .iter()
+                .filter(|a| crate::agent_display::extract_project_name(&a.workdir) == project)
+                .map(|a| a.pane_key.pane_id.as_str())
+                .collect();
+
+            panes.retain(|p| project_panes.contains(p));
+        }
+    }
+
+    if panes.is_empty() {
+        anyhow::bail!("no matching agents found");
+    }
 
     let current_idx = panes.iter().position(|&pid| pid == current_pane_id);
 
@@ -472,6 +505,44 @@ pub fn navigate(action: NavAction) -> Result<()> {
     Cmd::new("tmux")
         .args(&["switch-client", "-t", target_pane])
         .run()?;
+
+    signal_daemon();
+    Ok(())
+}
+
+/// Set sidebar filter mode from CLI. Toggles if no mode is given.
+pub fn set_filter_mode(mode: Option<&str>) -> Result<()> {
+    use app::SidebarFilterMode;
+
+    let new_mode = match mode {
+        Some(m) => SidebarFilterMode::from_str(m),
+        None => {
+            // Read current mode from tmux and toggle
+            let current = Cmd::new("tmux")
+                .args(&["show-option", "-gqv", "@workmux_sidebar_filter"])
+                .run_and_capture_stdout()
+                .unwrap_or_default();
+            SidebarFilterMode::from_str(current.trim()).toggle()
+        }
+    };
+
+    // Write to tmux global
+    let _ = Cmd::new("tmux")
+        .args(&[
+            "set-option",
+            "-g",
+            "@workmux_sidebar_filter",
+            new_mode.as_str(),
+        ])
+        .run();
+
+    // Persist to settings.json
+    if let Ok(store) = crate::state::StateStore::new()
+        && let Ok(mut settings) = store.load_settings()
+    {
+        settings.sidebar_filter = Some(new_mode.as_str().to_string());
+        let _ = store.save_settings(&settings);
+    }
 
     signal_daemon();
     Ok(())
