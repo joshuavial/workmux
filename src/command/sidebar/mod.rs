@@ -774,6 +774,32 @@ fn compute_nav_target(action: &NavAction, current_idx: Option<usize>, len: usize
     })
 }
 
+fn current_navigation_project(
+    current_pane_id: &str,
+    agents: &[crate::state::AgentState],
+) -> Option<String> {
+    agents
+        .iter()
+        .find(|a| a.pane_key.pane_id == current_pane_id)
+        .map(|a| crate::agent_display::extract_project_name(&a.workdir))
+        .or_else(|| {
+            Cmd::new("tmux")
+                .args(&[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    current_pane_id,
+                    "#{pane_current_path}",
+                ])
+                .run_and_capture_stdout()
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from)
+                .map(|p| crate::agent_display::extract_project_name(&p))
+        })
+}
+
 /// Navigate to an agent by reading the daemon's ordered agent list from tmux.
 /// Respects the sidebar filter mode: when set to "project", only navigates
 /// among agents belonging to the same project as the current pane.
@@ -815,13 +841,7 @@ pub fn navigate(action: NavAction) -> Result<()> {
         && let Ok(store) = crate::state::StateStore::new()
         && let Ok(agents) = store.list_all_agents()
     {
-        // Get the current pane's project name
-        let current_project = agents.iter().find_map(|a| {
-            (a.pane_key.pane_id == current_pane_id)
-                .then(|| crate::agent_display::extract_project_name(&a.workdir))
-        });
-
-        if let Some(project) = current_project {
+        if let Some(project) = current_navigation_project(current_pane_id, &agents) {
             // Build set of pane IDs that belong to this project
             let project_panes: std::collections::HashSet<&str> = agents
                 .iter()
@@ -897,6 +917,28 @@ pub fn set_filter_mode(mode: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{AgentState, PaneKey};
+    use std::path::PathBuf;
+
+    fn test_agent_state(pane_id: &str, workdir: &str) -> AgentState {
+        AgentState {
+            pane_key: PaneKey {
+                backend: "tmux".to_string(),
+                instance: "default".to_string(),
+                pane_id: pane_id.to_string(),
+            },
+            workdir: PathBuf::from(workdir),
+            status: None,
+            status_ts: None,
+            pane_title: None,
+            pane_pid: 1,
+            command: "zsh".to_string(),
+            updated_ts: 0,
+            window_name: None,
+            session_name: None,
+            boot_id: None,
+        }
+    }
 
     #[test]
     fn parses_session_id_set() {
@@ -986,33 +1028,28 @@ mod tests {
     #[test]
     fn resolve_width_uses_synced_width() {
         let config = crate::config::Config::default();
-        // Synced width of 40 in a 200-col window should return 40
         assert_eq!(resolve_width_for(&config, 200, Some(40)), 40);
     }
 
     #[test]
     fn resolve_width_clamps_synced_to_window() {
         let config = crate::config::Config::default();
-        // Synced width of 80 in a 60-col window should clamp to 50 (60 - 10)
         assert_eq!(resolve_width_for(&config, 60, Some(80)), 50);
-        // Synced width of 5 should clamp to minimum 10
         assert_eq!(resolve_width_for(&config, 200, Some(5)), 10);
     }
 
     #[test]
     fn resolve_width_clamps_narrow_window() {
         let config = crate::config::Config::default();
-        // In a 25-col window, max is 15 (25 - 10), clamp 50 to [10, 15] = 15
         assert_eq!(resolve_width_for(&config, 25, Some(50)), 15);
     }
 
     #[test]
     fn resolve_width_falls_back_to_default_without_sync() {
         let config = crate::config::Config::default();
-        // Default is 10% of window width, clamped to [25, 50]
-        assert_eq!(resolve_width_for(&config, 200, None), 25); // 10% = 20, clamped to 25
-        assert_eq!(resolve_width_for(&config, 500, None), 50); // 10% = 50, at max
-        assert_eq!(resolve_width_for(&config, 400, None), 40); // 10% = 40
+        assert_eq!(resolve_width_for(&config, 200, None), 25);
+        assert_eq!(resolve_width_for(&config, 500, None), 50);
+        assert_eq!(resolve_width_for(&config, 400, None), 40);
     }
 
     #[test]
@@ -1046,7 +1083,6 @@ mod tests {
     fn resolve_width_uses_explicit_config_before_synced_width() {
         let mut config = crate::config::Config::default();
         config.sidebar.width = Some(crate::config::SidebarWidth::Percent(10));
-        // Synced width of 150 should be ignored; 10% of 200 = 20
         assert_eq!(resolve_width_for(&config, 200, Some(150)), 20);
     }
 
@@ -1055,5 +1091,20 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.sidebar.width = Some(crate::config::SidebarWidth::Absolute(80));
         assert_eq!(resolve_width_for(&config, 100, None), 80);
+    }
+
+    #[test]
+    fn navigation_project_prefers_agent_workdir() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("alpha");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let worktree = repo.join(".worktrees").join("feature");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let agents = vec![test_agent_state("%1", worktree.to_str().unwrap())];
+        assert_eq!(
+            current_navigation_project("%1", &agents).as_deref(),
+            Some("alpha")
+        );
     }
 }
