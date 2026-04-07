@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 
+use crate::command::pane_history::pane_to_remember;
 use crate::multiplexer::{create_backend, detect_backend};
 use crate::state::StateStore;
 
@@ -50,12 +51,11 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Only persist after successful switch, and only if current pane is an agent
-    if let Some(ref current) = current_pane
-        && agents.iter().any(|a| a.pane_id == *current)
-    {
+    // Persist the pane we came from so hotkeys can toggle back even when
+    // invoked from a normal shell/editor pane.
+    if let Some(current) = pane_to_remember(current_pane.as_deref(), &target_pane_id) {
         let mut settings = store.load_settings()?;
-        settings.last_pane_id = Some(current.clone());
+        settings.last_pane_id = Some(current.to_string());
         store.save_settings(&settings)?;
     }
 
