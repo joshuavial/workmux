@@ -19,7 +19,7 @@ Workmux can display the status of the agent in your tmux window list, giving you
 | Codex        | ✅ Supported\*                                                              |
 | Copilot CLI  | ✅ Supported\*                                                              |
 | Pi           | ✅ Supported\*                                                              |
-| Gemini CLI   | [In progress](https://github.com/google-gemini/gemini-cli/issues/9070)      |
+| Gemini CLI   | ✅ Supported                                                                |
 | Kiro         | [Tracking issue](https://github.com/kirodotdev/Kiro/issues/5440)            |
 | Mistral Vibe | [Tracking issue](https://github.com/mistralai/mistral-vibe/discussions/334) |
 
@@ -44,7 +44,7 @@ Run `workmux setup` to automatically detect your agent CLIs and install status t
 workmux setup
 ```
 
-This detects Claude Code, Copilot CLI, OpenCode, and Pi by checking for their configuration directories, then offers to install the appropriate hooks. Workmux will also prompt you on first run if it detects an agent without status tracking configured.
+This detects Claude Code, Gemini CLI, Copilot CLI, OpenCode, and Pi by checking for their configuration directories, then offers to install the appropriate hooks. Workmux will also prompt you on first run if it detects an agent without status tracking configured.
 
 Workmux automatically modifies your tmux `window-status-format` to display the status icons. This happens once per session and only affects the current tmux session (not your global config).
 
@@ -82,6 +82,26 @@ curl -o ~/.config/opencode/plugin/workmux-status.ts \
 ```
 
 Restart OpenCode for the plugin to take effect.
+
+## Gemini CLI setup
+
+If you prefer manual setup, add the workmux hooks to your Gemini settings:
+
+```bash
+# Download and merge hooks into ~/.gemini/settings.json
+curl -s https://raw.githubusercontent.com/raine/workmux/main/.gemini/hooks/workmux-status.json \
+  | python3 -c "
+import json, sys, pathlib
+hooks = json.load(sys.stdin)['hooks']
+p = pathlib.Path.home() / '.gemini/settings.json'
+s = json.loads(p.read_text()) if p.exists() else {}
+s.setdefault('hooks', {}).update(hooks)
+p.write_text(json.dumps(s, indent=2) + '\n')
+print('Installed hooks to', p)
+"
+```
+
+Alternatively, manually copy the hook entries from [.gemini/hooks/workmux-status.json](https://github.com/raine/workmux/blob/main/.gemini/hooks/workmux-status.json) into your `~/.gemini/settings.json`.
 
 ## Codex setup
 
