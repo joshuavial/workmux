@@ -121,8 +121,27 @@ the list. Requires `set -g mouse on` in your `~/.tmux.conf`.
 | `Enter` | Jump to agent pane       |
 | `g`/`G` | Jump to first/last       |
 | `v`     | Toggle layout mode       |
+| `p`     | Toggle project filter    |
 | `z`     | Toggle sleeping on agent |
 | `q`     | Quit sidebar             |
+
+### Project filter
+
+Press `p` to filter the sidebar to only show agents belonging to the same
+project as the current window. This is useful when you have many agents across
+different projects and want to focus on the current one. Press `p` again to
+show all agents.
+
+The filter also applies to agent navigation hotkeys (`next`/`prev`/`jump`), so
+`Alt+j`/`Alt+k` will only cycle through agents in the current project.
+
+You can also toggle the filter from the command line:
+
+```bash
+workmux sidebar filter          # Toggle between none and project
+workmux sidebar filter project  # Filter to current project
+workmux sidebar filter none     # Show all agents (no filter)
+```
 
 ### Sleeping agents
 

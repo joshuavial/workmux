@@ -14,7 +14,7 @@ use crate::multiplexer::{AgentPane, AgentStatus};
 use crate::tmux_style;
 use crate::ui::theme::ThemePalette;
 
-use super::app::{SidebarApp, SidebarLayoutMode};
+use super::app::{SidebarApp, SidebarFilterMode, SidebarLayoutMode};
 use super::template::TokenId;
 use super::template::context::RowContext;
 use super::template::layout::{
@@ -454,12 +454,42 @@ pub fn render_sidebar(f: &mut Frame, app: &mut SidebarApp) {
 
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let list_area = render_template_error(f, app, inner);
+    let inner = render_template_error(f, app, inner);
+
+    // Reserve bottom line for filter indicator when in Project mode
+    let (list_area, filter_area) = if app.filter_mode == SidebarFilterMode::Project {
+        if inner.height > 1 {
+            let list = Rect::new(inner.x, inner.y, inner.width, inner.height - 1);
+            let filter = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+            (list, Some(filter))
+        } else {
+            (inner, None)
+        }
+    } else {
+        (inner, None)
+    };
     app.list_area = list_area;
 
     match app.layout_mode {
         SidebarLayoutMode::Compact => render_compact_list(f, app, list_area),
         SidebarLayoutMode::Tiles => render_tile_list(f, app, list_area),
+    }
+
+    // Render filter indicator
+    if let Some(filter_rect) = filter_area {
+        let label = app
+            .host_project_name()
+            .map(|p| format!("[project: {}]", p))
+            .unwrap_or_else(|| "[project]".to_string());
+        let label = truncate_to_width(&label, filter_rect.width as usize);
+        let line = Line::from(Span::styled(
+            label,
+            Style::default()
+                .fg(app.palette.dimmed)
+                .add_modifier(Modifier::DIM),
+        ))
+        .alignment(Alignment::Center);
+        f.render_widget(line, filter_rect);
     }
 }
 
@@ -483,6 +513,20 @@ fn render_template_error(f: &mut Frame, app: &SidebarApp, area: Rect) -> Rect {
         .wrap(Wrap { trim: false });
     f.render_widget(warning, chunks[0]);
     chunks[1]
+}
+
+fn truncate_to_width(s: &str, max_width: usize) -> String {
+    let mut width = 0;
+    let mut result = String::new();
+    for c in s.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(1);
+        if width + w > max_width {
+            break;
+        }
+        width += w;
+        result.push(c);
+    }
+    result
 }
 
 fn wrapped_line_count(s: &str, width: usize) -> usize {
