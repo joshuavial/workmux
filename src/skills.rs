@@ -59,6 +59,7 @@ pub fn skills_dir(agent: Agent) -> Option<PathBuf> {
             };
             Some(pi_dir.join("skills"))
         }
+        Agent::Gemini => Some(home.join(".gemini/skills")),
         Agent::Codex | Agent::Copilot => None,
     }
 }
