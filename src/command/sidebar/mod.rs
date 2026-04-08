@@ -430,12 +430,24 @@ fn compute_nav_target(action: &NavAction, current_idx: Option<usize>, len: usize
 
 fn current_navigation_project(
     current_pane_id: &str,
+    current_window_id: &str,
     agents: &[crate::state::AgentState],
+    pane_window_ids: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
     agents
         .iter()
         .find(|a| a.pane_key.pane_id == current_pane_id)
         .map(|a| crate::agent_display::extract_project_name(&a.workdir))
+        .or_else(|| {
+            agents
+                .iter()
+                .find(|a| {
+                    pane_window_ids
+                        .get(&a.pane_key.pane_id)
+                        .is_some_and(|window_id| window_id == current_window_id)
+                })
+                .map(|a| crate::agent_display::extract_project_name(&a.workdir))
+        })
         .or_else(|| {
             Cmd::new("tmux")
                 .args(&[
@@ -452,6 +464,40 @@ fn current_navigation_project(
                 .map(std::path::PathBuf::from)
                 .map(|p| crate::agent_display::extract_project_name(&p))
         })
+}
+
+fn pane_window_ids() -> std::collections::HashMap<String, String> {
+    Cmd::new("tmux")
+        .args(&["list-panes", "-a", "-F", "#{pane_id}\t#{window_id}"])
+        .run_and_capture_stdout()
+        .ok()
+        .map(|output| {
+            output
+                .lines()
+                .filter_map(|line| {
+                    let (pane_id, window_id) = line.split_once('\t')?;
+                    Some((pane_id.to_string(), window_id.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn current_listed_window_pane<'a>(
+    panes: &'a [&str],
+    current_pane_id: &'a str,
+    current_window_id: &str,
+    pane_window_ids: &std::collections::HashMap<String, String>,
+) -> Option<&'a str> {
+    if panes.contains(&current_pane_id) {
+        return Some(current_pane_id);
+    }
+
+    panes.iter().copied().find(|pane_id| {
+        pane_window_ids
+            .get(*pane_id)
+            .is_some_and(|window_id| window_id == current_window_id)
+    })
 }
 
 /// Navigate to an agent by reading the daemon's ordered agent list from tmux.
@@ -479,12 +525,18 @@ pub fn navigate(action: NavAction) -> Result<()> {
         anyhow::bail!("no sidebar agents found");
     }
 
-    // Find current agent by active pane ID
+    // Find current pane/window context
     let current_pane_id = Cmd::new("tmux")
         .args(&["display-message", "-p", "#{pane_id}"])
         .run_and_capture_stdout()
         .unwrap_or_default();
     let current_pane_id = current_pane_id.trim();
+    let current_window_id = Cmd::new("tmux")
+        .args(&["display-message", "-p", "#{window_id}"])
+        .run_and_capture_stdout()
+        .unwrap_or_default();
+    let current_window_id = current_window_id.trim();
+    let pane_window_ids = pane_window_ids();
 
     // Apply project filter if active
     let filter_mode = Cmd::new("tmux")
@@ -495,7 +547,12 @@ pub fn navigate(action: NavAction) -> Result<()> {
         && let Ok(store) = crate::state::StateStore::new()
         && let Ok(agents) = store.list_all_agents()
     {
-        if let Some(project) = current_navigation_project(current_pane_id, &agents) {
+        if let Some(project) = current_navigation_project(
+            current_pane_id,
+            current_window_id,
+            &agents,
+            &pane_window_ids,
+        ) {
             // Build set of pane IDs that belong to this project
             let project_panes: std::collections::HashSet<&str> = agents
                 .iter()
@@ -509,6 +566,18 @@ pub fn navigate(action: NavAction) -> Result<()> {
 
     if panes.is_empty() {
         anyhow::bail!("no matching agents found");
+    }
+
+    if let Some(current_window_pane) =
+        current_listed_window_pane(&panes, current_pane_id, current_window_id, &pane_window_ids)
+        && current_window_pane != current_pane_id
+        && !matches!(action, NavAction::Jump(_))
+    {
+        Cmd::new("tmux")
+            .args(&["switch-client", "-t", current_window_pane])
+            .run()?;
+        signal_daemon();
+        return Ok(());
     }
 
     let current_idx = panes.iter().position(|&pid| pid == current_pane_id);
@@ -668,7 +737,61 @@ mod tests {
 
         let agents = vec![test_agent_state("%1", worktree.to_str().unwrap())];
         assert_eq!(
-            current_navigation_project("%1", &agents).as_deref(),
+            current_navigation_project(
+                "%1",
+                "@10",
+                &agents,
+                &std::collections::HashMap::from([("%1".to_string(), "@10".to_string())]),
+            )
+            .as_deref(),
+            Some("alpha")
+        );
+    }
+
+    #[test]
+    fn current_window_falls_back_to_listed_agent_pane() {
+        let panes = vec!["%1", "%2"];
+        let pane_window_ids = std::collections::HashMap::from([
+            ("%1".to_string(), "@10".to_string()),
+            ("%2".to_string(), "@20".to_string()),
+        ]);
+
+        assert_eq!(
+            current_listed_window_pane(&panes, "%99", "@20", &pane_window_ids),
+            Some("%2")
+        );
+    }
+
+    #[test]
+    fn current_listed_pane_wins_over_window_fallback() {
+        let panes = vec!["%1", "%2"];
+        let pane_window_ids = std::collections::HashMap::from([
+            ("%1".to_string(), "@10".to_string()),
+            ("%2".to_string(), "@10".to_string()),
+        ]);
+
+        assert_eq!(
+            current_listed_window_pane(&panes, "%2", "@10", &pane_window_ids),
+            Some("%2")
+        );
+    }
+
+    #[test]
+    fn navigation_project_falls_back_to_agent_in_current_window() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("alpha");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let worktree = repo.join(".worktrees").join("feature");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let agents = vec![test_agent_state("%1", worktree.to_str().unwrap())];
+        let pane_window_ids = std::collections::HashMap::from([
+            ("%sidebar".to_string(), "@10".to_string()),
+            ("%1".to_string(), "@10".to_string()),
+        ]);
+
+        assert_eq!(
+            current_navigation_project("%sidebar", "@10", &agents, &pane_window_ids).as_deref(),
             Some("alpha")
         );
     }
