@@ -1106,7 +1106,6 @@ pub fn run() -> Result<()> {
                 .map(|a| a.pane_id.as_str())
                 .collect::<Vec<_>>()
                 .join(" ");
-
             if agent_list != last_agent_list {
                 if !agent_list.is_empty() {
                     let _ = Cmd::new("tmux")
