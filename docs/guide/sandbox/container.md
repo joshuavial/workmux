@@ -92,6 +92,19 @@ sandbox:
     # cpus: 8       # optional, Apple Container defaults to 4
 ```
 
+**Hide specific files from the container:**
+
+```yaml
+sandbox:
+  enabled: true
+  container:
+    excluded_files:
+      - .env
+      - .env.local
+```
+
+Listed paths are relative to the worktree root. Each one is shadowed by a read-only `/dev/null` bind mount, so agents running inside the container cannot read the host file without having to restructure the project. Paths that escape the worktree (absolute paths or `..` segments) are rejected; files that don't exist on disk are skipped with a warning.
+
 **Sandbox all panes (not just agent):**
 
 ```yaml
