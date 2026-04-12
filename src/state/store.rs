@@ -565,6 +565,7 @@ mod tests {
             worktree_sort_mode: Some("age".to_string()),
             last_done_cycle: None,
             sidebar_layout: None,
+            sidebar_filter: None,
         };
 
         store.save_settings(&settings).unwrap();

@@ -9,12 +9,14 @@ use crate::config::StatusIcons;
 use crate::git::GitStatus;
 use crate::multiplexer::{AgentPane, AgentStatus};
 
-use super::app::SidebarLayoutMode;
+use super::app::{SidebarFilterMode, SidebarLayoutMode};
 
 /// A complete sidebar state snapshot, pushed from daemon to clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SidebarSnapshot {
     pub layout_mode: SidebarLayoutMode,
+    #[serde(default)]
+    pub filter_mode: SidebarFilterMode,
     pub active_windows: HashSet<(String, String)>,
     #[serde(default)]
     pub active_pane_ids: HashSet<String>,
@@ -43,6 +45,7 @@ pub fn build_snapshot(
     active_pane_ids: HashSet<String>,
     window_pane_counts: HashMap<String, usize>,
     layout_mode: SidebarLayoutMode,
+    filter_mode: SidebarFilterMode,
     status_icons: &StatusIcons,
     git_statuses: HashMap<PathBuf, GitStatus>,
     sleeping_pane_ids: &HashSet<String>,
@@ -102,6 +105,7 @@ pub fn build_snapshot(
 
     SidebarSnapshot {
         layout_mode,
+        filter_mode,
         active_windows,
         active_pane_ids,
         window_pane_counts,

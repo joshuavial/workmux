@@ -30,7 +30,6 @@ mod snapshot;
 mod ui;
 
 use anyhow::{Result, anyhow};
-
 use crate::cmd::Cmd;
 
 use self::daemon_ctrl::{ensure_daemon_running, kill_daemon, signal_daemon};
@@ -428,7 +427,107 @@ fn compute_nav_target(action: &NavAction, current_idx: Option<usize>, len: usize
     })
 }
 
+fn current_navigation_project(
+    current_pane_id: &str,
+    current_window_id: &str,
+    pane_paths: &std::collections::HashMap<String, std::path::PathBuf>,
+    pane_window_ids: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    pane_paths
+        .get(current_pane_id)
+        .map(|p| crate::agent_display::extract_project_name(p))
+        .or_else(|| {
+            pane_paths
+                .iter()
+                .find(|(pane_id, _)| {
+                    pane_window_ids
+                        .get(*pane_id)
+                        .is_some_and(|window_id| window_id == current_window_id)
+                })
+                .map(|(_, path)| crate::agent_display::extract_project_name(path))
+        })
+        .or_else(|| {
+            Cmd::new("tmux")
+                .args(&[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    current_pane_id,
+                    "#{pane_current_path}",
+                ])
+                .run_and_capture_stdout()
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from)
+                .map(|p| crate::agent_display::extract_project_name(&p))
+        })
+}
+
+fn pane_window_ids() -> std::collections::HashMap<String, String> {
+    Cmd::new("tmux")
+        .args(&["list-panes", "-a", "-F", "#{pane_id}\t#{window_id}"])
+        .run_and_capture_stdout()
+        .ok()
+        .map(|output| {
+            output
+                .lines()
+                .filter_map(|line| {
+                    let (pane_id, window_id) = line.split_once('\t')?;
+                    Some((pane_id.to_string(), window_id.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn pane_paths() -> std::collections::HashMap<String, std::path::PathBuf> {
+    Cmd::new("tmux")
+        .args(&["list-panes", "-a", "-F", "#{pane_id}\t#{pane_current_path}"])
+        .run_and_capture_stdout()
+        .ok()
+        .map(|output| {
+            output
+                .lines()
+                .filter_map(|line| {
+                    let (pane_id, path) = line.split_once('\t')?;
+                    Some((pane_id.to_string(), std::path::PathBuf::from(path)))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn current_listed_window_pane<'a>(
+    panes: &'a [&str],
+    current_pane_id: &'a str,
+    current_window_id: &str,
+    pane_window_ids: &std::collections::HashMap<String, String>,
+) -> Option<&'a str> {
+    if panes.contains(&current_pane_id) {
+        return Some(current_pane_id);
+    }
+
+    panes.iter().copied().find(|pane_id| {
+        pane_window_ids
+            .get(*pane_id)
+            .is_some_and(|window_id| window_id == current_window_id)
+    })
+}
+
+fn navigation_anchor_pane<'a>(
+    panes: &'a [&str],
+    current_pane_id: &'a str,
+    current_window_id: &str,
+    pane_window_ids: &std::collections::HashMap<String, String>,
+) -> Option<&'a str> {
+    current_listed_window_pane(panes, current_pane_id, current_window_id, pane_window_ids)
+        .or(Some(current_pane_id).filter(|pane_id| panes.contains(pane_id)))
+}
+
 /// Navigate to an agent by reading the daemon's ordered agent list from tmux.
+/// Respects the sidebar filter mode: when set to "project", only navigates
+/// among agents belonging to the same project as the current pane.
 pub fn navigate(action: NavAction) -> Result<()> {
     if std::env::var("TMUX").is_err() {
         return Err(anyhow!("Sidebar requires tmux"));
@@ -445,20 +544,54 @@ pub fn navigate(action: NavAction) -> Result<()> {
     }
 
     // Parse space-separated pane IDs
-    let panes: Vec<&str> = agents_str.split_whitespace().collect();
+    let mut panes: Vec<&str> = agents_str.split_whitespace().collect();
 
     if panes.is_empty() {
         anyhow::bail!("no sidebar agents found");
     }
 
-    // Find current agent by active pane ID
+    // Find current pane/window context
     let current_pane_id = Cmd::new("tmux")
         .args(&["display-message", "-p", "#{pane_id}"])
         .run_and_capture_stdout()
         .unwrap_or_default();
     let current_pane_id = current_pane_id.trim();
+    let current_window_id = Cmd::new("tmux")
+        .args(&["display-message", "-p", "#{window_id}"])
+        .run_and_capture_stdout()
+        .unwrap_or_default();
+    let current_window_id = current_window_id.trim();
+    let pane_window_ids = pane_window_ids();
+    let pane_paths = pane_paths();
 
-    let current_idx = panes.iter().position(|&pid| pid == current_pane_id);
+    // Apply project filter if active
+    let filter_mode = Cmd::new("tmux")
+        .args(&["show-option", "-gqv", "@workmux_sidebar_filter"])
+        .run_and_capture_stdout()
+        .unwrap_or_default();
+    if filter_mode.trim() == "project" {
+        if let Some(project) = current_navigation_project(
+            current_pane_id,
+            current_window_id,
+            &pane_paths,
+            &pane_window_ids,
+        ) {
+            panes.retain(|pane_id| {
+                pane_paths
+                    .get(*pane_id)
+                    .is_some_and(|path| crate::agent_display::extract_project_name(path) == project)
+            });
+        }
+    }
+
+    if panes.is_empty() {
+        anyhow::bail!("no matching agents found");
+    }
+
+    let current_anchor =
+        navigation_anchor_pane(&panes, current_pane_id, current_window_id, &pane_window_ids);
+    let current_idx =
+        current_anchor.and_then(|pane_id| panes.iter().position(|&pid| pid == pane_id));
 
     let len = panes.len();
     let target_idx = match &action {
@@ -469,9 +602,52 @@ pub fn navigate(action: NavAction) -> Result<()> {
     };
 
     let target_pane = panes[target_idx];
+    if let Some(target_window_id) = pane_window_ids.get(target_pane) {
+        Cmd::new("tmux")
+            .args(&["select-window", "-t", target_window_id])
+            .run()?;
+    }
     Cmd::new("tmux")
-        .args(&["switch-client", "-t", target_pane])
+        .args(&["select-pane", "-t", target_pane])
         .run()?;
+
+    signal_daemon();
+    Ok(())
+}
+
+/// Set sidebar filter mode from CLI. Toggles if no mode is given.
+pub fn set_filter_mode(mode: Option<&str>) -> Result<()> {
+    use app::SidebarFilterMode;
+
+    let new_mode = match mode {
+        Some(m) => SidebarFilterMode::from_str(m),
+        None => {
+            // Read current mode from tmux and toggle
+            let current = Cmd::new("tmux")
+                .args(&["show-option", "-gqv", "@workmux_sidebar_filter"])
+                .run_and_capture_stdout()
+                .unwrap_or_default();
+            SidebarFilterMode::from_str(current.trim()).toggle()
+        }
+    };
+
+    // Write to tmux global
+    let _ = Cmd::new("tmux")
+        .args(&[
+            "set-option",
+            "-g",
+            "@workmux_sidebar_filter",
+            new_mode.as_str(),
+        ])
+        .run();
+
+    // Persist to settings.json
+    if let Ok(store) = crate::state::StateStore::new()
+        && let Ok(mut settings) = store.load_settings()
+    {
+        settings.sidebar_filter = Some(new_mode.as_str().to_string());
+        let _ = store.save_settings(&settings);
+    }
 
     signal_daemon();
     Ok(())
@@ -480,6 +656,7 @@ pub fn navigate(action: NavAction) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn next_wraps_from_last_to_first() {
@@ -543,5 +720,142 @@ mod tests {
     #[test]
     fn single_agent_prev_stays() {
         assert_eq!(compute_nav_target(&NavAction::Prev, Some(0), 1), Some(0));
+    }
+
+    #[test]
+    fn navigation_project_prefers_agent_workdir() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("alpha");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let worktree = repo.join(".worktrees").join("feature");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let pane_paths =
+            std::collections::HashMap::from([("%1".to_string(), worktree.to_path_buf())]);
+        assert_eq!(
+            current_navigation_project(
+                "%1",
+                "@10",
+                &pane_paths,
+                &std::collections::HashMap::from([("%1".to_string(), "@10".to_string())]),
+            )
+            .as_deref(),
+            Some("alpha")
+        );
+    }
+
+    #[test]
+    fn current_window_falls_back_to_listed_agent_pane() {
+        let panes = vec!["%1", "%2"];
+        let pane_window_ids = std::collections::HashMap::from([
+            ("%1".to_string(), "@10".to_string()),
+            ("%2".to_string(), "@20".to_string()),
+        ]);
+
+        assert_eq!(
+            current_listed_window_pane(&panes, "%99", "@20", &pane_window_ids),
+            Some("%2")
+        );
+    }
+
+    #[test]
+    fn current_listed_pane_wins_over_window_fallback() {
+        let panes = vec!["%1", "%2"];
+        let pane_window_ids = std::collections::HashMap::from([
+            ("%1".to_string(), "@10".to_string()),
+            ("%2".to_string(), "@10".to_string()),
+        ]);
+
+        assert_eq!(
+            current_listed_window_pane(&panes, "%2", "@10", &pane_window_ids),
+            Some("%2")
+        );
+    }
+
+    #[test]
+    fn navigation_anchor_uses_agent_in_current_window() {
+        let panes = vec!["%1", "%2"];
+        let pane_window_ids = std::collections::HashMap::from([
+            ("%sidebar".to_string(), "@10".to_string()),
+            ("%1".to_string(), "@10".to_string()),
+            ("%2".to_string(), "@20".to_string()),
+        ]);
+
+        assert_eq!(
+            navigation_anchor_pane(&panes, "%sidebar", "@10", &pane_window_ids),
+            Some("%1")
+        );
+    }
+
+    #[test]
+    fn navigation_anchor_prefers_current_agent_pane() {
+        let panes = vec!["%1", "%2"];
+        let pane_window_ids = std::collections::HashMap::from([
+            ("%1".to_string(), "@10".to_string()),
+            ("%2".to_string(), "@10".to_string()),
+        ]);
+
+        assert_eq!(
+            navigation_anchor_pane(&panes, "%2", "@10", &pane_window_ids),
+            Some("%2")
+        );
+    }
+
+    #[test]
+    fn next_from_sidebar_in_filtered_two_window_project_advances_to_other_window() {
+        let panes = vec!["%0", "%317"];
+        let pane_window_ids = std::collections::HashMap::from([
+            ("%sidebar".to_string(), "@0".to_string()),
+            ("%0".to_string(), "@0".to_string()),
+            ("%317".to_string(), "@33".to_string()),
+        ]);
+
+        let current_idx = navigation_anchor_pane(&panes, "%sidebar", "@0", &pane_window_ids)
+            .and_then(|pane_id| panes.iter().position(|&pid| pid == pane_id));
+
+        assert_eq!(current_idx, Some(0));
+        assert_eq!(
+            compute_nav_target(&NavAction::Next, current_idx, panes.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn next_from_agent_in_filtered_two_window_project_advances_to_other_window() {
+        let panes = vec!["%0", "%317"];
+        let pane_window_ids = std::collections::HashMap::from([
+            ("%0".to_string(), "@0".to_string()),
+            ("%317".to_string(), "@33".to_string()),
+        ]);
+
+        let current_idx = navigation_anchor_pane(&panes, "%0", "@0", &pane_window_ids)
+            .and_then(|pane_id| panes.iter().position(|&pid| pid == pane_id));
+
+        assert_eq!(current_idx, Some(0));
+        assert_eq!(
+            compute_nav_target(&NavAction::Next, current_idx, panes.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn navigation_project_falls_back_to_agent_in_current_window() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("alpha");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let worktree = repo.join(".worktrees").join("feature");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let pane_paths =
+            std::collections::HashMap::from([("%1".to_string(), worktree.to_path_buf())]);
+        let pane_window_ids = std::collections::HashMap::from([
+            ("%sidebar".to_string(), "@10".to_string()),
+            ("%1".to_string(), "@10".to_string()),
+        ]);
+
+        assert_eq!(
+            current_navigation_project("%sidebar", "@10", &pane_paths, &pane_window_ids).as_deref(),
+            Some("alpha")
+        );
     }
 }

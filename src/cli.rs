@@ -752,6 +752,12 @@ pub enum SidebarAction {
         #[arg(value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
         index: u64,
     },
+    /// Set sidebar filter mode (all or project). Toggles if no mode given.
+    Filter {
+        /// Filter mode: "none" or "project"
+        #[arg(value_name = "MODE")]
+        mode: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -969,6 +975,9 @@ pub fn run() -> Result<()> {
             }
             Some(SidebarAction::Jump { index }) => {
                 command::sidebar::navigate(command::sidebar::NavAction::Jump(index as usize))
+            }
+            Some(SidebarAction::Filter { mode }) => {
+                command::sidebar::set_filter_mode(mode.as_deref())
             }
             None => {
                 if session {

@@ -19,7 +19,7 @@ use crate::git::GitStatus;
 use crate::multiplexer::{Multiplexer, create_backend, detect_backend};
 use crate::state::StateStore;
 
-use super::app::SidebarLayoutMode;
+use super::app::{SidebarFilterMode, SidebarLayoutMode};
 use super::snapshot::build_snapshot;
 
 /// Compute socket path from instance_id.
@@ -227,6 +227,29 @@ fn read_sidebar_layout_mode(config: &Config) -> Option<SidebarLayoutMode> {
     }
 
     None
+}
+
+/// Read the sidebar filter mode from tmux global, falling back to settings.json.
+fn read_sidebar_filter_mode() -> SidebarFilterMode {
+    if let Ok(output) = Cmd::new("tmux")
+        .args(&["show-option", "-gqv", "@workmux_sidebar_filter"])
+        .run_and_capture_stdout()
+    {
+        let trimmed = output.trim();
+        if !trimmed.is_empty() {
+            return SidebarFilterMode::from_str(trimmed);
+        }
+    }
+
+    // Fall back to persisted setting
+    if let Ok(store) = StateStore::new()
+        && let Ok(settings) = store.load_settings()
+        && let Some(ref mode) = settings.sidebar_filter
+    {
+        return SidebarFilterMode::from_str(mode);
+    }
+
+    SidebarFilterMode::default()
 }
 
 /// Read pane IDs manually marked as sleeping from the tmux global option.
@@ -1019,6 +1042,7 @@ pub fn run() -> Result<()> {
             let Some(agents) = agents else { continue };
 
             let layout_mode = read_sidebar_layout_mode(&config).unwrap_or_default();
+            let filter_mode = read_sidebar_filter_mode();
             let sleeping_pane_ids = read_sleeping_panes();
             let git_statuses = git_cache.lock().ok().map(|c| c.clone()).unwrap_or_default();
             let captured_panes = gather_captures(&agents, mux.as_ref(), &inactivity_tracker);
@@ -1038,6 +1062,7 @@ pub fn run() -> Result<()> {
                     now,
                     now_ts,
                     layout_mode,
+                    filter_mode,
                     git_statuses,
                     sleeping_pane_ids,
                 },
@@ -1081,7 +1106,6 @@ pub fn run() -> Result<()> {
                 .map(|a| a.pane_id.as_str())
                 .collect::<Vec<_>>()
                 .join(" ");
-
             if agent_list != last_agent_list {
                 if !agent_list.is_empty() {
                     let _ = Cmd::new("tmux")
@@ -1158,6 +1182,7 @@ struct TickInput {
     now: Instant,
     now_ts: u64,
     layout_mode: SidebarLayoutMode,
+    filter_mode: SidebarFilterMode,
     git_statuses: HashMap<PathBuf, GitStatus>,
     sleeping_pane_ids: HashSet<String>,
 }
@@ -1199,6 +1224,7 @@ fn compute_tick(
         now,
         now_ts,
         layout_mode,
+        filter_mode,
         git_statuses,
         sleeping_pane_ids,
     } = input;
@@ -1230,6 +1256,7 @@ fn compute_tick(
         tmux_state.active_pane_ids,
         tmux_state.window_pane_counts,
         layout_mode,
+        filter_mode,
         status_icons,
         git_statuses,
         &sleeping_pane_ids,
@@ -1681,6 +1708,7 @@ mod tests {
                     now,
                     now_ts,
                     layout_mode: SidebarLayoutMode::default(),
+                    filter_mode: SidebarFilterMode::default(),
                     git_statuses: HashMap::new(),
                     sleeping_pane_ids: HashSet::new(),
                 },
