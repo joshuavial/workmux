@@ -18,6 +18,10 @@ pub enum SetWindowStatusCommand {
 }
 
 pub fn run(cmd: SetWindowStatusCommand) -> Result<()> {
+    if std::env::var("WORKMUX_SUPPRESS_STATUS").is_ok() {
+        return Ok(());
+    }
+
     // Inside a sandbox guest, route through RPC to the host supervisor
     if crate::sandbox::guest::is_sandbox_guest() {
         return run_via_rpc(cmd);
