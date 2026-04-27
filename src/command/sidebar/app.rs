@@ -37,33 +37,33 @@ impl SidebarLayoutMode {
     }
 }
 
-/// Sidebar filter mode: show all agents or only those matching the host's project.
+/// Sidebar filter mode: show all agents or only those in the host tmux session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SidebarFilterMode {
     #[default]
     None,
-    Project,
+    Session,
 }
 
 impl SidebarFilterMode {
     pub fn toggle(self) -> Self {
         match self {
-            Self::None => Self::Project,
-            Self::Project => Self::None,
+            Self::None => Self::Session,
+            Self::Session => Self::None,
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::Project => "project",
+            Self::Session => "session",
         }
     }
 
     pub fn from_str(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
-            "project" => Self::Project,
+            "session" | "project" => Self::Session,
             _ => Self::None,
         }
     }
@@ -107,11 +107,8 @@ pub struct SidebarApp {
     pub interrupted_pane_ids: std::collections::HashSet<String>,
     /// Pane IDs of agents manually marked as sleeping by the user.
     pub sleeping_pane_ids: std::collections::HashSet<String>,
-    /// Filter mode: show all agents or only those matching the host's project.
+    /// Filter mode: show all agents or only those in the host tmux session.
     pub filter_mode: SidebarFilterMode,
-    /// Working directory of the host pane (detected once at startup, used as fallback
-    /// for project detection when the host window has no agent).
-    host_pane_cwd: Option<PathBuf>,
 }
 
 impl SidebarApp {
@@ -131,7 +128,6 @@ impl SidebarApp {
         let status_icons = config.status_icons.clone();
 
         let (host_session, host_window_id) = detect_host_window();
-        let host_pane_cwd = detect_host_pane_cwd();
 
         Ok(Self {
             mux,
@@ -155,7 +151,6 @@ impl SidebarApp {
             interrupted_pane_ids: std::collections::HashSet::new(),
             sleeping_pane_ids: std::collections::HashSet::new(),
             filter_mode: SidebarFilterMode::default(),
-            host_pane_cwd,
         })
     }
 
@@ -208,12 +203,11 @@ impl SidebarApp {
 
         self.agents = snapshot.agents;
 
-        // Apply project filter: retain only agents matching the host's project
-        if self.filter_mode == SidebarFilterMode::Project
-            && let Some(host_project) = self.host_project_name()
+        // Apply session filter: retain only agents in the sidebar's host session.
+        if self.filter_mode == SidebarFilterMode::Session
+            && let Some(host_session) = self.host_session.as_deref()
         {
-            self.agents
-                .retain(|a| extract_project_name(&a.path) == host_project);
+            self.agents.retain(|a| a.session == host_session);
             // Recompute host_agent_idx after filtering
             self.host_agent_idx = self
                 .host_window_id
@@ -254,6 +248,10 @@ impl SidebarApp {
 
     pub fn host_window_id(&self) -> Option<&str> {
         self.host_window_id.as_deref()
+    }
+
+    pub fn host_session(&self) -> Option<&str> {
+        self.host_session.as_deref()
     }
 
     pub fn host_window_active(&self) -> bool {
@@ -452,15 +450,6 @@ impl SidebarApp {
         super::daemon_ctrl::signal_daemon();
     }
 
-    /// The project name derived from the host window. Prefers the host agent's path,
-    /// falls back to the host pane's working directory for non-agent windows.
-    pub fn host_project_name(&self) -> Option<String> {
-        self.host_agent_idx
-            .and_then(|idx| self.agents.get(idx))
-            .map(|a| extract_project_name(&a.path))
-            .or_else(|| self.host_pane_cwd.as_ref().map(|p| extract_project_name(p)))
-    }
-
     pub fn window_prefix(&self) -> &str {
         &self.window_prefix
     }
@@ -519,41 +508,19 @@ fn detect_host_window() -> (Option<String>, Option<String>) {
     (session, window_id)
 }
 
-/// Detect the working directory of the sidebar's host pane (one-time at startup).
-/// Used as a fallback for project detection when the host window has no agent.
-fn detect_host_pane_cwd() -> Option<PathBuf> {
-    let pane_id = std::env::var("TMUX_PANE").ok()?;
-    let output = Cmd::new("tmux")
-        .args(&[
-            "display-message",
-            "-t",
-            &pane_id,
-            "-p",
-            "#{pane_current_path}",
-        ])
-        .run_and_capture_stdout()
-        .ok()?;
-    let path = output.trim();
-    if path.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(path))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn filter_mode_toggle() {
-        assert_eq!(SidebarFilterMode::None.toggle(), SidebarFilterMode::Project);
-        assert_eq!(SidebarFilterMode::Project.toggle(), SidebarFilterMode::None);
+        assert_eq!(SidebarFilterMode::None.toggle(), SidebarFilterMode::Session);
+        assert_eq!(SidebarFilterMode::Session.toggle(), SidebarFilterMode::None);
     }
 
     #[test]
     fn filter_mode_roundtrip_strings() {
-        for mode in [SidebarFilterMode::None, SidebarFilterMode::Project] {
+        for mode in [SidebarFilterMode::None, SidebarFilterMode::Session] {
             assert_eq!(SidebarFilterMode::from_str(mode.as_str()), mode);
         }
     }
@@ -570,12 +537,16 @@ mod tests {
     #[test]
     fn filter_mode_from_str_case_insensitive() {
         assert_eq!(
-            SidebarFilterMode::from_str("Project"),
-            SidebarFilterMode::Project
+            SidebarFilterMode::from_str("Session"),
+            SidebarFilterMode::Session
         );
         assert_eq!(
-            SidebarFilterMode::from_str("PROJECT"),
-            SidebarFilterMode::Project
+            SidebarFilterMode::from_str("SESSION"),
+            SidebarFilterMode::Session
+        );
+        assert_eq!(
+            SidebarFilterMode::from_str("project"),
+            SidebarFilterMode::Session
         );
     }
 

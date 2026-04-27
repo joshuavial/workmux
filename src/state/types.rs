@@ -168,7 +168,7 @@ pub struct GlobalSettings {
     #[serde(default)]
     pub sidebar_layout: Option<String>,
 
-    /// Sidebar filter mode: "all" or "project"
+    /// Sidebar filter mode: "none" or "session"
     #[serde(default)]
     pub sidebar_filter: Option<String>,
 }
