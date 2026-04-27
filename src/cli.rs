@@ -842,9 +842,9 @@ pub enum SidebarAction {
         #[arg(value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
         index: u64,
     },
-    /// Set sidebar filter mode (all or project). Toggles if no mode given.
+    /// Set sidebar filter mode (none or session). Toggles if no mode given.
     Filter {
-        /// Filter mode: "none" or "project"
+        /// Filter mode: "none" or "session"
         #[arg(value_name = "MODE")]
         mode: Option<String>,
     },
