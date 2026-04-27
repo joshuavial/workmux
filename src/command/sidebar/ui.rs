@@ -468,7 +468,7 @@ pub fn render_sidebar(f: &mut Frame, app: &mut SidebarApp) {
     f.render_widget(block, area);
     let inner = render_template_error(f, app, inner);
 
-    let (list_area, filter_area) = if app.filter_mode == SidebarFilterMode::Project {
+    let (list_area, filter_area) = if app.filter_mode == SidebarFilterMode::Session {
         if inner.height > 1 {
             let list = Rect::new(inner.x, inner.y, inner.width, inner.height - 1);
             let filter = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
@@ -488,9 +488,9 @@ pub fn render_sidebar(f: &mut Frame, app: &mut SidebarApp) {
 
     if let Some(filter_rect) = filter_area {
         let label = app
-            .host_project_name()
-            .map(|p| format!("[project: {}]", p))
-            .unwrap_or_else(|| "[project]".to_string());
+            .host_session()
+            .map(|s| format!("[session: {}]", s))
+            .unwrap_or_else(|| "[session]".to_string());
         let label = truncate_to_width(&label, filter_rect.width as usize);
         let line = Line::from(Span::styled(
             label,

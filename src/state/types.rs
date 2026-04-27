@@ -190,7 +190,7 @@ pub struct GlobalSettings {
     #[serde(default)]
     pub sidebar_height: Option<u16>,
 
-    /// Sidebar filter mode: "all" or "project"
+    /// Sidebar filter mode: "none" or "session"
     #[serde(default)]
     pub sidebar_filter: Option<String>,
 }

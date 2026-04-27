@@ -31,7 +31,7 @@ Each agent row displays:
 | `Enter` | Jump to agent pane       |
 | `g`/`G` | Jump to first/last       |
 | `v`     | Toggle layout mode       |
-| `p`     | Toggle project filter    |
+| `s`     | Toggle session filter    |
 | `z`     | Toggle sleeping on agent |
 | `q`     | Quit sidebar             |
 
@@ -50,8 +50,8 @@ sidebar:
 | `workmux sidebar next`            | Switch to the next agent (wraps)              |
 | `workmux sidebar prev`            | Switch to the previous agent (wraps)          |
 | `workmux sidebar jump <N>`        | Jump to the Nth agent (1-indexed)             |
-| `workmux sidebar filter`          | Toggle project filter (none/project)          |
-| `workmux sidebar filter <MODE>`   | Set filter mode: `none` or `project`          |
+| `workmux sidebar filter`          | Toggle session filter (none/session)          |
+| `workmux sidebar filter <MODE>`   | Set filter mode: `none` or `session`          |
 
 ### Example tmux keybindings
 
