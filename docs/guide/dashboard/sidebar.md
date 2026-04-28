@@ -91,11 +91,10 @@ Click an agent tile to jump to its pane, or scroll to navigate the list. Require
 
 ### Session filter
 
-By default, the sidebar shows agents from all tmux sessions.
-Press `s` to filter the sidebar to only show agents in the same tmux session as
-the current window. This is useful when each session maps to a project or
-workspace and you want to focus on the current one. Press `s` again to
-show all agents.
+By default, the sidebar only shows agents in the same tmux session as the
+current window. This is useful when each session maps to a project or workspace
+and you want to focus on the current one. Press `s` to show agents from all
+tmux sessions; press `s` again to return to the current session.
 
 The filter also applies to agent navigation hotkeys (`next`/`prev`/`jump`), so
 `Alt+j`/`Alt+k` will only cycle through agents in the current session.
