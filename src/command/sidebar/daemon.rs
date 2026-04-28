@@ -397,13 +397,22 @@ fn remove_worktree_watch(
     }
 }
 
-/// Whether the platform can handle recursive worktree watches efficiently.
-/// macOS FSEvents aggregates events at the directory level in the kernel and
-/// handles heavy I/O well. Linux inotify sets a watch per directory and
-/// generates an event per file operation, which overwhelms the system under
-/// heavy AI/MCP file activity.
+/// Whether to start filesystem watches for sidebar git status refreshes.
+///
+/// macOS builds use notify's FSEvents backend, but production measurements still
+/// showed large ancestor-directory fd footprints for the sidebar daemon. Use the
+/// polling sweep there so the daemon stays comfortably below the launchd fd cap.
+fn use_filesystem_watcher_for_git_status() -> bool {
+    !cfg!(target_os = "macos")
+}
+
+/// Whether the platform can handle recursive worktree-root watches efficiently.
+/// Linux inotify sets a watch per directory and generates an event per file
+/// operation, which overwhelms the system under heavy AI/MCP file activity.
+/// macOS intentionally uses poll-only mode via
+/// `use_filesystem_watcher_for_git_status`.
 fn platform_supports_worktree_watches() -> bool {
-    cfg!(target_os = "macos")
+    false
 }
 
 /// Set up filesystem watches for a worktree.
@@ -558,10 +567,11 @@ struct GitWorkerPath {
 
 /// Spawn a background thread that watches for git changes and updates the cache.
 ///
-/// Uses the `notify` crate for OS-level filesystem event detection (FSEvents on macOS).
-/// Watches .git internals and worktree roots for each active worktree. Events are
-/// debounced per-worktree (300ms) before triggering `get_git_status()`. A fallback
-/// sweep runs every 30s for edge cases where the watcher might miss events.
+/// Uses the `notify` crate for OS-level filesystem event detection on platforms
+/// where that does not create a large fd footprint. Watches .git internals for
+/// each active worktree. Events are debounced per-worktree (300ms) before
+/// triggering `get_git_status()`. A fallback sweep keeps status fresh for
+/// platforms or environments where watches are disabled.
 fn spawn_git_worker(
     term: Arc<AtomicBool>,
     dirty_flag: Arc<AtomicBool>,
@@ -578,35 +588,43 @@ fn spawn_git_worker(
         let (fs_tx, fs_rx) = std::sync::mpsc::sync_channel(256);
         let fs_overflow = Arc::new(AtomicBool::new(false));
         let fs_overflow_clone = fs_overflow.clone();
-        let mut watcher: Option<notify::RecommendedWatcher> = match notify::RecommendedWatcher::new(
-            move |event: notify::Result<notify::Event>| {
-                if let Ok(ref e) = event {
-                    // Filter out .git internal traffic that doesn't affect status.
-                    // Gitignore-based filtering (node_modules, target, etc.) happens
-                    // in the worker thread where matchers are available.
-                    let dominated_by_noise = e.paths.iter().all(|p| {
-                        let s = p.to_string_lossy();
-                        s.contains("/.git/objects/") || s.contains("/.git/logs/")
-                    });
-                    if dominated_by_noise {
-                        return;
+        let mut watcher: Option<notify::RecommendedWatcher> =
+            if use_filesystem_watcher_for_git_status() {
+                match notify::RecommendedWatcher::new(
+                    move |event: notify::Result<notify::Event>| {
+                        if let Ok(ref e) = event {
+                            // Filter out .git internal traffic that doesn't affect status.
+                            // Gitignore-based filtering (node_modules, target, etc.) happens
+                            // in the worker thread where matchers are available.
+                            let dominated_by_noise = e.paths.iter().all(|p| {
+                                let s = p.to_string_lossy();
+                                s.contains("/.git/objects/") || s.contains("/.git/logs/")
+                            });
+                            if dominated_by_noise {
+                                return;
+                            }
+                        }
+                        if let Err(std::sync::mpsc::TrySendError::Full(_)) = fs_tx.try_send(event) {
+                            fs_overflow_clone.store(true, Ordering::Relaxed);
+                        }
+                    },
+                    notify::Config::default(),
+                ) {
+                    Ok(w) => Some(w),
+                    Err(e) => {
+                        tracing::warn!(
+                            "filesystem watcher unavailable, falling back to polling: {}",
+                            e
+                        );
+                        None
                     }
                 }
-                if let Err(std::sync::mpsc::TrySendError::Full(_)) = fs_tx.try_send(event) {
-                    fs_overflow_clone.store(true, Ordering::Relaxed);
-                }
-            },
-            notify::Config::default(),
-        ) {
-            Ok(w) => Some(w),
-            Err(e) => {
-                tracing::warn!(
-                    "filesystem watcher unavailable, falling back to polling: {}",
-                    e
+            } else {
+                tracing::info!(
+                    "sidebar git-status filesystem watcher disabled on this platform; using polling"
                 );
                 None
-            }
-        };
+            };
 
         let mut active_entries: Vec<GitWorkerPath> = Vec::new();
         // Maps: watched directory -> set of worktrees it covers
@@ -623,13 +641,13 @@ fn spawn_git_worker(
         let mut unique_active: Vec<PathBuf> = Vec::new();
         let mut last_full_sweep = Instant::now();
         let full_sweep_interval = if watcher.is_none() {
-            // No watcher available: poll frequently as the only change detection
-            Duration::from_secs(2)
+            // No watcher available: poll as the only change detection.
+            Duration::from_secs(5)
         } else if platform_supports_worktree_watches() {
-            // macOS: worktree watches give instant detection, sweep is just a safety net
+            // Recursive worktree watches give instant detection, sweep is just a safety net.
             Duration::from_secs(30)
         } else {
-            // Linux: only .git metadata is watched, working tree changes need polling.
+            // Only .git metadata is watched, so working tree changes need polling.
             // 5s balances responsiveness with CPU cost (one git-status per worktree).
             Duration::from_secs(5)
         };
@@ -1306,6 +1324,19 @@ mod tests {
     use crate::multiplexer::{AgentPane, AgentStatus};
     use std::cell::RefCell;
     use std::path::PathBuf;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_git_status_uses_polling_to_bound_fds() {
+        assert!(!use_filesystem_watcher_for_git_status());
+        assert!(!platform_supports_worktree_watches());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn non_macos_git_status_can_use_filesystem_watcher() {
+        assert!(use_filesystem_watcher_for_git_status());
+    }
 
     fn working_agent(pane_id: &str, updated_ts: u64) -> AgentPane {
         AgentPane {
