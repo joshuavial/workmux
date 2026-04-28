@@ -29,8 +29,8 @@ mod runtime;
 mod snapshot;
 mod ui;
 
-use anyhow::{Result, anyhow};
 use crate::cmd::Cmd;
+use anyhow::{Result, anyhow};
 
 use self::daemon_ctrl::{ensure_daemon_running, kill_daemon, signal_daemon};
 use self::hooks::{install_hooks, remove_hooks};
@@ -461,6 +461,27 @@ fn pane_session_ids() -> std::collections::HashMap<String, String> {
         .unwrap_or_default()
 }
 
+fn read_sidebar_filter_mode() -> app::SidebarFilterMode {
+    if let Ok(output) = Cmd::new("tmux")
+        .args(&["show-option", "-gqv", "@workmux_sidebar_filter"])
+        .run_and_capture_stdout()
+    {
+        let trimmed = output.trim();
+        if !trimmed.is_empty() {
+            return app::SidebarFilterMode::from_str(trimmed);
+        }
+    }
+
+    if let Ok(store) = crate::state::StateStore::new()
+        && let Ok(settings) = store.load_settings()
+        && let Some(ref mode) = settings.sidebar_filter
+    {
+        return app::SidebarFilterMode::from_str(mode);
+    }
+
+    app::SidebarFilterMode::default()
+}
+
 fn current_listed_window_pane<'a>(
     panes: &'a [&str],
     current_pane_id: &'a str,
@@ -527,12 +548,8 @@ pub fn navigate(action: NavAction) -> Result<()> {
     let pane_window_ids = pane_window_ids();
     let pane_session_ids = pane_session_ids();
 
-    // Apply session filter if active
-    let filter_mode = Cmd::new("tmux")
-        .args(&["show-option", "-gqv", "@workmux_sidebar_filter"])
-        .run_and_capture_stdout()
-        .unwrap_or_default();
-    if app::SidebarFilterMode::from_str(filter_mode.trim()) == app::SidebarFilterMode::Session {
+    // Apply session filter if active.
+    if read_sidebar_filter_mode() == app::SidebarFilterMode::Session {
         let current_session = Cmd::new("tmux")
             .args(&["display-message", "-p", "#{session_name}"])
             .run_and_capture_stdout()
@@ -582,14 +599,7 @@ pub fn set_filter_mode(mode: Option<&str>) -> Result<()> {
 
     let new_mode = match mode {
         Some(m) => SidebarFilterMode::from_str(m),
-        None => {
-            // Read current mode from tmux and toggle
-            let current = Cmd::new("tmux")
-                .args(&["show-option", "-gqv", "@workmux_sidebar_filter"])
-                .run_and_capture_stdout()
-                .unwrap_or_default();
-            SidebarFilterMode::from_str(current.trim()).toggle()
-        }
+        None => read_sidebar_filter_mode().toggle(),
     };
 
     // Write to tmux global
