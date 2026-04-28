@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import yaml
+
 from ..conftest import (
     FakeAgentInstaller,
     MuxEnvironment,
@@ -12,6 +14,8 @@ from ..conftest import (
     create_commit,
     file_for_commit,
     get_window_name,
+    run_workmux_command,
+    slugify,
     wait_for_file,
     wait_for_pane_output,
     write_global_workmux_config,
@@ -388,3 +392,154 @@ class TestBaseBranchConfig:
         # Should have the CLI base commit, not the config base commit
         assert file_for_commit(worktree_path, cli_commit).exists()
         assert not file_for_commit(worktree_path, config_commit).exists()
+
+
+class TestConfigOverride:
+    """Tests for --config CLI override."""
+
+    def test_config_override_applies_settings(
+        self,
+        mux_server: MuxEnvironment,
+        workmux_exe_path: Path,
+        mux_repo_path: Path,
+    ):
+        """--config should load the specified config file instead of discovering."""
+        env = mux_server
+        branch_name = "feature-config-override"
+        override_prefix = "override-"
+
+        # Write the default project config with a different prefix
+        write_workmux_config(mux_repo_path, window_prefix="default-")
+
+        # Write an alternate config file
+        alt_config = mux_repo_path / ".workmux.alt.yaml"
+        alt_config.write_text(f"window_prefix: {override_prefix}\nnerdfont: false\n")
+
+        add_branch_and_get_worktree(
+            env,
+            workmux_exe_path,
+            mux_repo_path,
+            branch_name,
+            extra_args=f"--config {alt_config}",
+        )
+
+        override_window = f"{override_prefix}{branch_name}"
+        assert_window_exists(env, override_window)
+
+        # The default prefix should NOT have been used
+        existing_windows = env.list_windows()
+        assert f"default-{branch_name}" not in existing_windows
+
+    def test_config_override_missing_file_fails(
+        self,
+        mux_server: MuxEnvironment,
+        workmux_exe_path: Path,
+        mux_repo_path: Path,
+    ):
+        """--config with a nonexistent file should produce a clear error."""
+        env = mux_server
+        branch_name = "feature-missing-config"
+        missing_config = mux_repo_path / "nonexistent.yaml"
+
+        write_workmux_config(mux_repo_path)
+
+        result = run_workmux_command(
+            env,
+            workmux_exe_path,
+            mux_repo_path,
+            f"add {branch_name} --config {missing_config}",
+            expect_fail=True,
+        )
+
+        assert "Config file not found" in result.stderr
+
+    def test_config_override_directory_fails(
+        self,
+        mux_server: MuxEnvironment,
+        workmux_exe_path: Path,
+        mux_repo_path: Path,
+    ):
+        """--config with a directory path should produce a clear error."""
+        env = mux_server
+        branch_name = "feature-dir-config"
+        dir_path = mux_repo_path / "config_dir"
+        dir_path.mkdir()
+
+        write_workmux_config(mux_repo_path)
+
+        result = run_workmux_command(
+            env,
+            workmux_exe_path,
+            mux_repo_path,
+            f"add {branch_name} --config {dir_path}",
+            expect_fail=True,
+        )
+
+        assert "must be a file, not a directory" in result.stderr
+
+    def test_config_override_still_merges_with_global(
+        self,
+        mux_server: MuxEnvironment,
+        workmux_exe_path: Path,
+        mux_repo_path: Path,
+    ):
+        """--config should still merge with global config (global values apply when not overridden)."""
+        env = mux_server
+        branch_name = "feature-config-merge"
+        global_hook = "global_from_merge.txt"
+        override_prefix = "merged-"
+
+        write_global_workmux_config(env, post_create=[f"touch {global_hook}"])
+
+        # Alternate config only overrides window_prefix, not post_create
+        alt_config = mux_repo_path / ".workmux.merge.yaml"
+        alt_config.write_text(f"window_prefix: {override_prefix}\nnerdfont: false\n")
+
+        worktree_path = add_branch_and_get_worktree(
+            env,
+            workmux_exe_path,
+            mux_repo_path,
+            branch_name,
+            extra_args=f"--config {alt_config}",
+        )
+
+        # Global post_create should still have run
+        assert (worktree_path / global_hook).exists()
+
+        # Override prefix should have been used
+        assert_window_exists(env, f"{override_prefix}{branch_name}")
+
+
+class TestWorktreeDirPlaceholders:
+    """Tests for `{project}` and tilde expansion in `worktree_dir`."""
+
+    def test_global_worktree_dir_with_project_placeholder_and_tilde(
+        self,
+        mux_server: MuxEnvironment,
+        workmux_exe_path: Path,
+        mux_repo_path: Path,
+    ):
+        """A single global `worktree_dir: ~/.workmux/{project}` should namespace each
+        repo under HOME without per-project configuration (the use case from #148)."""
+        env = mux_server
+        branch_name = "feature-placeholder"
+
+        # Write directly to the global config: the existing helper does not
+        # accept `worktree_dir`, but we want to exercise the actual user flow
+        # of setting this once globally.
+        global_config_dir = env.home_path / ".config" / "workmux"
+        global_config_dir.mkdir(parents=True, exist_ok=True)
+        (global_config_dir / "config.yaml").write_text(
+            yaml.dump({"worktree_dir": "~/.workmux/{project}", "nerdfont": False})
+        )
+
+        run_workmux_command(
+            env,
+            workmux_exe_path,
+            mux_repo_path,
+            f"add {branch_name}",
+        )
+
+        handle = slugify(branch_name)
+        expected = env.home_path / ".workmux" / mux_repo_path.name / handle
+        assert expected.is_dir(), f"expected worktree at {expected}"

@@ -354,7 +354,10 @@ fn run_container(
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string();
-    let container_name = format!("wm-{}-{}", handle, std::process::id());
+    // Slugify only the container name; the raw handle is used as the state store key
+    // so cleanup (which derives the handle from the directory name without slugifying)
+    // can find it.
+    let container_name = format!("wm-{}-{}", slug::slugify(&handle), std::process::id());
 
     // Register container in state store so cleanup can find it without docker ps
     if let Ok(store) = StateStore::new()

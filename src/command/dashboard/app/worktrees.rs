@@ -411,22 +411,61 @@ impl App {
         }
     }
 
-    /// Execute sweep: remove all selected candidates.
+    /// Execute sweep: remove all selected candidates in a background thread.
     pub fn confirm_sweep(&mut self) {
         let Some(sweep) = self.pending_sweep.take() else {
             return;
         };
 
-        let paths_to_remove: Vec<PathBuf> = sweep
+        let paths_to_remove: Vec<(String, PathBuf)> = sweep
             .candidates
-            .iter()
+            .into_iter()
             .filter(|c| c.selected)
-            .map(|c| c.path.clone())
+            .map(|c| (c.handle, c.path))
             .collect();
 
-        for path in &paths_to_remove {
-            self.do_remove_worktree(path, false);
+        if paths_to_remove.is_empty() {
+            return;
         }
+
+        let total = paths_to_remove.len();
+        let config = self.config.clone();
+        let mux = self.mux.clone();
+        let tx = self.event_tx.clone();
+
+        self.sweep_progress = Some(SweepProgress {
+            total,
+            current: 1,
+            handle: paths_to_remove[0].0.clone(),
+        });
+
+        std::thread::spawn(move || {
+            let Ok(ctx) = workflow::WorkflowContext::new(config, mux, None) else {
+                let _ = tx.send(AppEvent::SweepComplete(Err(
+                    "Failed to create workflow context".to_string(),
+                )));
+                return;
+            };
+
+            let mut failures = 0;
+            for (i, (handle, _path)) in paths_to_remove.iter().enumerate() {
+                let _ = tx.send(AppEvent::SweepProgressUpdate(i + 1, total, handle.clone()));
+
+                if workflow::remove(handle, true, false, &ctx).is_err() {
+                    failures += 1;
+                }
+            }
+
+            if failures > 0 {
+                let _ = tx.send(AppEvent::SweepComplete(Err(format!(
+                    "Removed {}/{} worktrees",
+                    total - failures,
+                    total
+                ))));
+            } else {
+                let _ = tx.send(AppEvent::SweepComplete(Ok(())));
+            }
+        });
     }
 
     // ── Project picker methods ─────────────────────────────────────
@@ -1138,6 +1177,7 @@ impl App {
                         handle: &handle,
                         base_branch: None,
                         remote_branch: Some(&remote_branch),
+                        pr_number: None,
                         prompt: None,
                         options,
                         mode_override: None,
@@ -1196,6 +1236,7 @@ impl App {
                         handle: &handle,
                         base_branch: base_branch.as_deref(),
                         remote_branch: None,
+                        pr_number: None,
                         prompt: None,
                         options,
                         mode_override: None,

@@ -43,6 +43,12 @@ quick overview.
 
 ![workmux screenshot](https://raw.githubusercontent.com/raine/workmux/refs/heads/main/meta/screenshot_20260329_165534.webp)
 
+> [!TIP]
+> [consult-llm](https://github.com/raine/consult-llm) pairs naturally with
+> workmux: let your agents consult another AI model to plan architecture,
+> review changes, debate approaches, or get unstuck on tricky bugs without
+> leaving the worktree.
+
 ## Why workmux?
 
 **Parallel workflows.** Work on multiple features the same time, each with its
@@ -119,24 +125,25 @@ curl -fsSL https://raw.githubusercontent.com/raine/workmux/main/scripts/install.
 brew install raine/workmux/workmux
 ```
 
-### Cargo
+<details>
+<summary>Other methods (Cargo, mise, Nix)</summary>
 
-Requires Rust. Install via [rustup](https://rustup.rs/) if you don't have it.
-
+**Cargo** (requires [rustup](https://rustup.rs/)):
 ```bash
 cargo install workmux
 ```
 
-### Nix
-
+**mise:**
 ```bash
-nix profile install github:raine/workmux
-# or try without installing
-nix run github:raine/workmux -- --help
+mise use -g cargo:raine/workmux
 ```
 
-See [Nix guide](https://workmux.raine.dev/guide/nix) for flake and home-manager
-setup.
+**Nix** ([flake and home-manager setup](https://workmux.raine.dev/guide/nix)):
+```bash
+nix profile install github:raine/workmux
+```
+
+</details>
 
 ---
 
@@ -260,7 +267,7 @@ customize.
 | ---------------- | ----------------------------------------------------------------------------------------------- | --------------------------- |
 | `main_branch`    | Branch to merge into                                                                            | Auto-detected               |
 | `base_branch`    | Default base branch for new worktrees                                                           | Current branch              |
-| `worktree_dir`   | Directory for worktrees (absolute or relative)                                                  | `<project>__worktrees/`     |
+| `worktree_dir`   | Directory for worktrees (absolute or relative). Supports `~` and `{project}`.                   | `<project>__worktrees/`     |
 | `window_prefix`  | Prefix for tmux window/session names                                                            | `wm-`                       |
 | `mode`           | Tmux mode (`window` or `session`)                                                               | `window`                    |
 | `agent`          | Default agent for `<agent>` placeholder                                                         | `claude`                    |
@@ -492,6 +499,10 @@ simultaneously without conflicts.
 
 You can customize the worktree directory location using the `worktree_dir`
 configuration option (see [Configuration options](#configuration-options)).
+The value supports `~` for the home directory and a `{project}` placeholder
+that resolves to the main worktree's directory name. This lets a single
+global config namespace every repo's worktrees under one root, e.g.
+`worktree_dir: ~/.workmux/{project}`.
 
 ### Shell alias (recommended)
 
@@ -582,6 +593,8 @@ immediately. If the branch doesn't exist, it will be created automatically.
   know or care whether the worktree already exists.
 - `-s, --session`: Create a tmux session instead of a window. See
   [Session mode](#session-mode) for details.
+- `--config <path>`: Use an alternate config file for this invocation. Still
+  merges with global config.
 - `--fork`: Fork the last conversation from the current worktree into the new
   one. The agent resumes with the forked conversation context. Use
   `--fork=<session-id>` to fork a specific session (prefix matching supported).
@@ -1339,6 +1352,8 @@ worktrees at once.
 - `-s, --session`: Open in session mode, overriding the stored mode. Persists
   the mode change for subsequent opens. Cannot be combined with `--new`. Only
   supported with tmux.
+- `--config <path>`: Use an alternate config file for this invocation. Still
+  merges with global config.
 - `--run-hooks`: Re-runs the `post_create` commands (these block window
   creation).
 - `--force-files`: Re-applies file copy/symlink operations. Useful for restoring
@@ -2571,7 +2586,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup.
   hunk-level git staging for AI agents
 - [claude-history](https://github.com/raine/claude-history) — Search and view
   Claude Code conversation history with fzf
-- [consult-llm-mcp](https://github.com/raine/consult-llm-mcp) — MCP server that
-  lets Claude Code consult stronger AI models (o3, Gemini, GPT-5.1 Codex)
+- [consult-llm](https://github.com/raine/consult-llm) — Consult other AI models
+  from your agent workflow
 - [tmux-agent-usage](https://github.com/raine/tmux-agent-usage) — Display AI agent
   rate limit usage in your tmux status bar

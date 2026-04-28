@@ -12,7 +12,7 @@ use super::super::agent;
 use super::super::ansi;
 use super::super::app::App;
 use super::super::spinner::SPINNER_FRAMES;
-use super::format::{format_git_status, format_pr_status};
+use super::format::{format_git_status, format_pr_status, truncate};
 
 /// Render the worktree table in the given area.
 pub fn render_worktree_table(f: &mut Frame, app: &mut App, area: Rect) {
@@ -99,6 +99,7 @@ pub fn render_worktree_table(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 wt.handle.clone()
             };
+            let worktree_display = truncate(&worktree_display, 25);
 
             // Git status
             let git_status = app.git_statuses.get(&wt.path);
@@ -210,7 +211,7 @@ pub fn render_worktree_table(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|(_, _, w, _, _, _, _, _, _, _)| w.len())
         .max()
         .unwrap_or(8)
-        .max(8)
+        .clamp(8, 25)
         + 1;
 
     let max_git_width = row_data
@@ -535,8 +536,14 @@ fn render_info_panel(
         // PR title (truncated to fit)
         let inner_width = area.width.saturating_sub(2) as usize; // border
         let title_max = inner_width.saturating_sub(8); // label width
-        let truncated_title = if pr.title.len() > title_max {
-            format!("{}...", &pr.title[..title_max.saturating_sub(3)])
+        let truncated_title = if pr.title.chars().count() > title_max {
+            format!(
+                "{}...",
+                pr.title
+                    .chars()
+                    .take(title_max.saturating_sub(3))
+                    .collect::<String>()
+            )
         } else {
             pr.title.clone()
         };

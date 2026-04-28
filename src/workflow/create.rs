@@ -42,6 +42,7 @@ pub fn create(context: &WorkflowContext, args: CreateArgs) -> Result<CreateResul
         handle,
         base_branch,
         remote_branch,
+        pr_number,
         prompt,
         mut options,
         mode_override,
@@ -229,10 +230,34 @@ pub fn create(context: &WorkflowContext, args: CreateArgs) -> Result<CreateResul
                 git::list_remotes()?
             ));
         }
-        spinner::with_spinner(&format!("Fetching from '{}'", spec.remote), || {
-            git::fetch_remote(&spec.remote)
-        })
-        .with_context(|| format!("Failed to fetch from remote '{}'", spec.remote))?;
+
+        // For PR checkout, try to fetch refs/pull/N/head from origin into the
+        // remote-tracking namespace. This ensures the PR code is available
+        // even if the head branch was deleted on the fork.
+        // If the PR ref doesn't exist (e.g., non-GitHub forge, local test repo),
+        // fall back to fetching from the fork remote directly.
+        if let Some(pr_number) = pr_number {
+            let pr_refspec = format!(
+                "+refs/pull/{}/head:refs/remotes/{}/{}",
+                pr_number, spec.remote, spec.branch
+            );
+            let pr_fetch =
+                spinner::with_spinner(&format!("Fetching PR #{} from origin", pr_number), || {
+                    git::fetch_refspec("origin", &pr_refspec)
+                });
+            if pr_fetch.is_err() {
+                spinner::with_spinner(&format!("Fetching from '{}'", spec.remote), || {
+                    git::fetch_remote(&spec.remote)
+                })
+                .with_context(|| format!("Failed to fetch from remote '{}'", spec.remote))?;
+            }
+        } else {
+            spinner::with_spinner(&format!("Fetching from '{}'", spec.remote), || {
+                git::fetch_remote(&spec.remote)
+            })
+            .with_context(|| format!("Failed to fetch from remote '{}'", spec.remote))?;
+        }
+
         let remote_ref = format!("{}/{}", spec.remote, spec.branch);
         if !git::branch_exists(&remote_ref)? {
             return Err(anyhow!(
@@ -269,15 +294,7 @@ pub fn create(context: &WorkflowContext, args: CreateArgs) -> Result<CreateResul
     // Always use main_worktree_root (not repo_root) to ensure consistent paths even when
     // running from inside an existing worktree.
     let base_dir = if let Some(ref worktree_dir) = context.config.worktree_dir {
-        let path = Path::new(worktree_dir);
-        if path.is_absolute() {
-            // Use absolute path as-is
-            path.to_path_buf()
-        } else {
-            // Relative path: resolve from main worktree root and normalize
-            // to collapse any ".." segments (e.g. "../wm/" -> clean absolute path)
-            crate::util::normalize_path(&context.main_worktree_root.join(path))
-        }
+        crate::util::expand_worktree_dir(worktree_dir, &context.main_worktree_root)?
     } else {
         // Default behavior: <main_worktree_root>/../<project_name>__worktrees
         let project_name = context
@@ -537,6 +554,7 @@ pub fn create_with_changes(
             handle,
             base_branch: None,
             remote_branch: None,
+            pr_number: None,
             prompt: None,
             options,
             mode_override: None,
