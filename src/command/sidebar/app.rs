@@ -63,6 +63,7 @@ impl SidebarFilterMode {
 
     pub fn from_str(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
+            "none" | "all" => Self::None,
             "session" | "project" => Self::Session,
             _ => Self::None,
         }
