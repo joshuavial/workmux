@@ -10,6 +10,19 @@ use tracing::{info, trace, warn};
 use super::types::{AgentState, GlobalSettings, PaneKey};
 use crate::config::SandboxRuntime;
 
+fn is_shell_command(command: &str) -> bool {
+    let token = crate::multiplexer::agent::find_executable_token(command);
+    let stem = Path::new(token)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(token);
+
+    matches!(
+        stem,
+        "bash" | "zsh" | "sh" | "dash" | "fish" | "nu" | "nushell" | "pwsh" | "powershell"
+    )
+}
+
 /// Manages filesystem-based state persistence for workmux agents.
 ///
 /// Directory structure:
@@ -456,6 +469,29 @@ impl StateStore {
                         let _ = mux.clear_status(&state.pane_key.pane_id);
                     }
                 }
+                Some(live)
+                    if live
+                        .current_command
+                        .as_deref()
+                        .is_some_and(is_shell_command)
+                        || is_shell_command(&state.command) =>
+                {
+                    if state.boot_id.is_some() && state.boot_id != current_boot_id {
+                        trace!(
+                            pane_id,
+                            "reconcile: preserving shell pane state from previous server lifecycle"
+                        );
+                    } else {
+                        info!(
+                            pane_id,
+                            stored_command = state.command,
+                            live_command = live.current_command.as_deref().unwrap_or(""),
+                            "reconcile: removing agent, foreground command is a shell"
+                        );
+                        self.delete_agent(&state.pane_key)?;
+                        let _ = mux.clear_status(&state.pane_key.pane_id);
+                    }
+                }
                 Some(live) => {
                     // Valid - include in dashboard
                     let mut agent_pane = state.to_agent_pane(
@@ -759,6 +795,17 @@ mod tests {
 
         let agents = store.list_all_agents().unwrap();
         assert_eq!(agents.len(), 1);
+    }
+
+    #[test]
+    fn shell_command_detection_matches_common_shells() {
+        assert!(is_shell_command("bash"));
+        assert!(is_shell_command("/bin/zsh"));
+        assert!(is_shell_command("env FOO=bar fish -l"));
+        assert!(is_shell_command("nu"));
+        assert!(!is_shell_command("node"));
+        assert!(!is_shell_command("claude"));
+        assert!(!is_shell_command("codex exec"));
     }
 
     #[test]
