@@ -48,8 +48,8 @@ impl SidebarLayoutMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SidebarFilterMode {
-    #[default]
     None,
+    #[default]
     Session,
 }
 
@@ -1421,7 +1421,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_mode_from_str_defaults_to_all() {
+    fn invalid_filter_mode_maps_to_all() {
         assert_eq!(SidebarFilterMode::from_str(""), SidebarFilterMode::None);
         assert_eq!(
             SidebarFilterMode::from_str("unknown"),
@@ -1446,7 +1446,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_mode_default_is_all() {
-        assert_eq!(SidebarFilterMode::default(), SidebarFilterMode::None);
+    fn filter_mode_default_is_session() {
+        assert_eq!(SidebarFilterMode::default(), SidebarFilterMode::Session);
     }
 }
