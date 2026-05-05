@@ -50,6 +50,9 @@ pub enum RpcRequest {
         no_hooks: bool,
         notification: bool,
     },
+    Close {
+        name: String,
+    },
     ClipboardRead {
         mime: String,
     },
@@ -314,6 +317,11 @@ fn handle_connection(stream: TcpStream, ctx: &RpcContext) -> Result<()> {
             continue;
         }
 
+        if let RpcRequest::Close { ref name } = request {
+            handle_close(name, &ctx.worktree_path, &mut writer)?;
+            continue;
+        }
+
         let response = dispatch_request(&request, ctx);
         debug!(?response, "RPC response");
 
@@ -356,6 +364,10 @@ fn dispatch_request(request: &RpcRequest, ctx: &RpcContext) -> RpcResponse {
         RpcRequest::Merge { .. } => {
             // Handled in handle_connection before dispatch (needs streaming)
             unreachable!("Merge is handled directly in handle_connection")
+        }
+        RpcRequest::Close { .. } => {
+            // Handled in handle_connection before dispatch
+            unreachable!("Close is handled directly in handle_connection")
         }
     }
 }
@@ -489,16 +501,24 @@ fn handle_clipboard_read(mime: &str, worktree_path: &std::path::Path) -> RpcResp
     }
 }
 
+fn host_workmux_command() -> std::process::Command {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("workmux"));
+    let mut cmd = std::process::Command::new(exe);
+    cmd.env_remove("WM_SANDBOX_GUEST")
+        .env_remove("WM_RPC_HOST")
+        .env_remove("WM_RPC_PORT")
+        .env_remove("WM_RPC_TOKEN");
+
+    cmd
+}
+
 fn handle_spawn_agent(
     prompt: &str,
     branch_name: Option<&str>,
     background: Option<bool>,
     worktree_path: &PathBuf,
 ) -> RpcResponse {
-    use std::process::Command;
-
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("workmux"));
-    let mut cmd = Command::new(exe);
+    let mut cmd = host_workmux_command();
     cmd.arg("add");
 
     if let Some(name) = branch_name {
@@ -551,10 +571,9 @@ fn handle_merge(
     worktree_path: &PathBuf,
     writer: &mut impl Write,
 ) -> Result<()> {
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("workmux"));
-    let mut cmd = Command::new(exe);
+    let mut cmd = host_workmux_command();
     cmd.arg("merge");
     cmd.arg(name);
 
@@ -719,6 +738,70 @@ fn sanitized_env() -> std::collections::HashMap<String, String> {
         }
     }
     envs
+}
+
+fn handle_close(name: &str, worktree_path: &PathBuf, writer: &mut impl Write) -> Result<()> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let mut cmd = host_workmux_command();
+    cmd.arg("close").arg(name);
+    cmd.current_dir(worktree_path);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            write_response(
+                writer,
+                &RpcResponse::Error {
+                    message: format!("Failed to run workmux close: {}", e),
+                },
+            )?;
+            return Ok(());
+        }
+    };
+
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+
+    let stdout_thread = thread::spawn(move || {
+        let mut output = String::new();
+        let mut reader = std::io::BufReader::new(stdout);
+        let _ = reader.read_to_string(&mut output);
+        output
+    });
+
+    let stderr_thread = thread::spawn(move || {
+        let mut output = String::new();
+        let mut reader = std::io::BufReader::new(stderr);
+        let _ = reader.read_to_string(&mut output);
+        output
+    });
+
+    let status = child.wait()?;
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+
+    if status.success() {
+        if !stdout.is_empty() {
+            write_response(writer, &RpcResponse::Output { message: stdout })?;
+        }
+        write_response(writer, &RpcResponse::Ok)?;
+    } else {
+        let message = if stderr.trim().is_empty() {
+            format!(
+                "workmux close exited with code {}",
+                status.code().unwrap_or(1)
+            )
+        } else {
+            stderr.trim().to_string()
+        };
+        write_response(writer, &RpcResponse::Error { message })?;
+    }
+
+    Ok(())
 }
 
 fn handle_exec(
@@ -998,6 +1081,7 @@ mod tests {
             r#"{"type":"SpawnAgent","prompt":"do stuff","branch_name":null,"background":null}"#,
             r#"{"type":"Exec","command":"cargo","args":["build","--release"]}"#,
             r#"{"type":"Merge","name":"feat","into":null,"rebase":true,"squash":false,"ignore_uncommitted":false,"keep":false,"no_verify":false,"no_hooks":false,"notification":false}"#,
+            r#"{"type":"Close","name":"feature-x"}"#,
             r#"{"type":"ClipboardRead","mime":"image/png"}"#,
         ];
         for json in cases {
@@ -1467,6 +1551,22 @@ mod tests {
     }
 
     #[test]
+    fn test_request_serialization_close() {
+        let req = RpcRequest::Close {
+            name: "feature-x".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"type\":\"Close\""));
+        assert!(json.contains("\"name\":\"feature-x\""));
+
+        let parsed: RpcRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            RpcRequest::Close { name } => assert_eq!(name, "feature-x"),
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
     fn test_response_serialization_output() {
         let resp = RpcResponse::Output {
             message: "Merged 'feature' into 'main'".to_string(),
@@ -1563,6 +1663,35 @@ mod tests {
     }
 
     // ── Git hook suppression tests ──────────────────────────────────────
+
+    #[test]
+    fn test_host_workmux_command_clears_guest_rpc_env() {
+        use std::ffi::OsStr;
+
+        let cmd = host_workmux_command();
+        let envs: std::collections::HashMap<&OsStr, Option<&OsStr>> = cmd.get_envs().collect();
+
+        assert_eq!(
+            envs.get(OsStr::new("WM_SANDBOX_GUEST")),
+            Some(&None),
+            "host workmux child must not inherit guest mode"
+        );
+        assert_eq!(
+            envs.get(OsStr::new("WM_RPC_HOST")),
+            Some(&None),
+            "host workmux child must not inherit guest RPC host"
+        );
+        assert_eq!(
+            envs.get(OsStr::new("WM_RPC_PORT")),
+            Some(&None),
+            "host workmux child must not inherit guest RPC port"
+        );
+        assert_eq!(
+            envs.get(OsStr::new("WM_RPC_TOKEN")),
+            Some(&None),
+            "host workmux child must not inherit guest RPC token"
+        );
+    }
 
     #[test]
     fn test_disable_git_hooks_sets_env_vars() {

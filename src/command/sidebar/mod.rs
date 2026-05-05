@@ -27,6 +27,7 @@ mod layout_tree;
 mod panes;
 mod runtime;
 mod snapshot;
+mod template;
 mod ui;
 
 use crate::cmd::Cmd;
@@ -49,6 +50,8 @@ const SIDEBAR_GLOBAL_OPTIONS: &[&str] = &[
     "@workmux_sidebar_agents",
     "@workmux_sleeping_panes",
     "@workmux_sidebar_scope",
+    "@workmux_sidebar_width",
+    "@workmux_sidebar_optout_sessions",
 ];
 
 /// Active sidebar scope on this tmux server.
@@ -104,6 +107,42 @@ fn set_scope(scope: &SidebarScope) {
     }
 }
 
+fn parse_session_id_set(raw: &str) -> std::collections::HashSet<String> {
+    raw.split_whitespace().map(String::from).collect()
+}
+
+fn serialize_session_id_set(ids: &std::collections::HashSet<String>) -> String {
+    let mut val: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+    val.sort_unstable();
+    val.join(" ")
+}
+
+fn current_optout_sessions() -> std::collections::HashSet<String> {
+    Cmd::new("tmux")
+        .args(&["show-option", "-gqv", "@workmux_sidebar_optout_sessions"])
+        .run_and_capture_stdout()
+        .ok()
+        .map(|s| parse_session_id_set(&s))
+        .unwrap_or_default()
+}
+
+fn set_optout_sessions(ids: &std::collections::HashSet<String>) {
+    if ids.is_empty() {
+        let _ = Cmd::new("tmux")
+            .args(&["set-option", "-gu", "@workmux_sidebar_optout_sessions"])
+            .run();
+    } else {
+        let val = serialize_session_id_set(ids);
+        let _ = Cmd::new("tmux")
+            .args(&["set-option", "-g", "@workmux_sidebar_optout_sessions", &val])
+            .run();
+    }
+}
+
+fn session_opted_out(session_id: &str) -> bool {
+    current_optout_sessions().contains(session_id)
+}
+
 /// Get the current tmux session's stable ID (e.g., "$0").
 fn get_current_session_id() -> Result<String> {
     let s = Cmd::new("tmux")
@@ -135,7 +174,16 @@ fn clear_sidebar_globals() {
 }
 
 /// Resolve sidebar width for a given terminal/window width.
-fn resolve_width_for(config: &crate::config::Config, tw: u16) -> u16 {
+///
+/// If `synced_width` is provided, it takes precedence over config/default.
+/// The result is clamped to ensure the sidebar is at least 10 columns
+/// and leaves at least 20 columns for content panes.
+fn resolve_width_for(config: &crate::config::Config, tw: u16, synced_width: Option<u16>) -> u16 {
+    if let Some(w) = synced_width {
+        let max_w = tw.saturating_sub(10).max(10);
+        return w.clamp(10, max_w);
+    }
+
     if let Some(ref w) = config.sidebar.width {
         // Explicit config: respect it, only enforce a minimum of 10
         return w.resolve(tw).max(10);
@@ -146,6 +194,117 @@ fn resolve_width_for(config: &crate::config::Config, tw: u16) -> u16 {
         return MIN_WIDTH;
     }
     (tw * 10 / 100).clamp(MIN_WIDTH, MAX_WIDTH)
+}
+
+/// Read the synced sidebar width from tmux global option, falling back to settings.
+fn read_sidebar_width() -> Option<u16> {
+    if let Ok(output) = Cmd::new("tmux")
+        .args(&["show-option", "-gqv", "@workmux_sidebar_width"])
+        .run_and_capture_stdout()
+        && let Ok(w) = output.trim().parse::<u16>()
+        && w > 0
+    {
+        return Some(w);
+    }
+
+    if let Ok(store) = crate::state::StateStore::new()
+        && let Ok(settings) = store.load_settings()
+    {
+        return settings.sidebar_width;
+    }
+
+    None
+}
+
+/// Set the synced sidebar width in tmux global option and persist to settings.
+fn set_sidebar_width(width: u16) {
+    let _ = Cmd::new("tmux")
+        .args(&[
+            "set-option",
+            "-g",
+            "@workmux_sidebar_width",
+            &width.to_string(),
+        ])
+        .run();
+
+    if let Ok(store) = crate::state::StateStore::new()
+        && let Ok(mut settings) = store.load_settings()
+    {
+        settings.sidebar_width = Some(width);
+        let _ = store.save_settings(&settings);
+    }
+}
+
+/// Resolve effective sidebar width, checking synced width first.
+fn effective_width_for(config: &crate::config::Config, window_w: u16) -> u16 {
+    let synced = read_sidebar_width();
+    resolve_width_for(config, window_w, synced)
+}
+
+/// Reflow all sidebar windows except the given one.
+pub(super) fn reflow_all_sidebars_except(exclude_window_id: &str) {
+    let config = crate::config::Config::load(None).unwrap_or_default();
+    let synced = read_sidebar_width();
+    let sidebars = panes::list_sidebar_panes();
+
+    for (window_id, pane_id) in sidebars {
+        if window_id == exclude_window_id {
+            continue;
+        }
+        let window_w: u16 = Cmd::new("tmux")
+            .args(&["display-message", "-t", &window_id, "-p", "#{window_width}"])
+            .run_and_capture_stdout()
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        let width = resolve_width_for(&config, window_w, synced);
+        layout_tree::reflow_after_sidebar_add(&window_id, &pane_id, width);
+    }
+}
+
+/// Reflow sidebar layouts in all windows. Called by the window-resized hook
+/// so inactive windows get their sidebar widths corrected without waiting for
+/// the user to visit them.
+pub fn reflow_all() -> Result<()> {
+    let scope = current_scope();
+    if matches!(scope, SidebarScope::Off) {
+        return Ok(());
+    }
+
+    let config = crate::config::Config::load(None).unwrap_or_default();
+    let synced = read_sidebar_width();
+
+    for (window_id, pane_id) in panes::list_sidebar_panes() {
+        // Scope filter
+        let window_session_id = get_window_session_id(&window_id);
+        match &scope {
+            SidebarScope::Global => match window_session_id {
+                Some(ref sid) if session_opted_out(sid) => continue,
+                Some(_) => {}
+                None => continue,
+            },
+            SidebarScope::Sessions(ids) => match window_session_id {
+                Some(ref sid) if ids.contains(sid) => {}
+                _ => continue,
+            },
+            SidebarScope::Off => continue,
+        }
+
+        let window_w: u16 = Cmd::new("tmux")
+            .args(&["display-message", "-t", &window_id, "-p", "#{window_width}"])
+            .run_and_capture_stdout()
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        if window_w == 0 {
+            continue;
+        }
+
+        let width = resolve_width_for(&config, window_w, synced);
+        layout_tree::reflow_after_sidebar_add(&window_id, &pane_id, width);
+    }
+
+    Ok(())
 }
 
 /// Toggle the sidebar globally across all tmux windows.
@@ -212,9 +371,16 @@ pub fn toggle_session() -> Result<()> {
     let session_id = get_current_session_id()?;
 
     if matches!(&scope, SidebarScope::Global) {
-        return Err(anyhow!(
-            "Global sidebar is active. Run `workmux sidebar` to disable it first."
-        ));
+        let mut optout_sessions = current_optout_sessions();
+        if optout_sessions.remove(&session_id) {
+            set_optout_sessions(&optout_sessions);
+            create_sidebars_in_session(&session_id, &config)?;
+        } else {
+            optout_sessions.insert(session_id.clone());
+            set_optout_sessions(&optout_sessions);
+            kill_sidebars_in_session(&session_id);
+        }
+        return Ok(());
     }
 
     let current_window = Cmd::new("tmux")
@@ -300,11 +466,18 @@ pub fn sync(window_id: Option<&str>) -> Result<()> {
     }
 
     // Session filter: skip windows not in a scoped session (or on lookup failure)
-    if let SidebarScope::Sessions(ref ids) = scope {
-        match get_window_session_id(&target) {
-            Some(window_sid) if ids.contains(&window_sid) => {}
+    let window_session_id = get_window_session_id(&target);
+    match &scope {
+        SidebarScope::Global => match window_session_id {
+            Some(ref window_sid) if session_opted_out(window_sid) => return Ok(()),
+            Some(_) => {}
+            None => return Ok(()),
+        },
+        SidebarScope::Sessions(ids) => match window_session_id {
+            Some(ref window_sid) if ids.contains(window_sid) => {}
             _ => return Ok(()),
-        }
+        },
+        SidebarScope::Off => return Ok(()),
     }
 
     // Check if this window already has a sidebar
@@ -322,7 +495,7 @@ pub fn sync(window_id: Option<&str>) -> Result<()> {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
-    let width = resolve_width_for(&config, window_w);
+    let width = effective_width_for(&config, window_w);
     create_sidebar_in_window(&target, width)?;
 
     Ok(())
@@ -344,11 +517,18 @@ pub fn reflow(window_id: Option<&str>) -> Result<()> {
     }
 
     // Session filter: skip windows not in a scoped session (or on lookup failure)
-    if let SidebarScope::Sessions(ref ids) = scope {
-        match get_window_session_id(&target) {
-            Some(window_sid) if ids.contains(&window_sid) => {}
+    let window_session_id = get_window_session_id(&target);
+    match &scope {
+        SidebarScope::Global => match window_session_id {
+            Some(ref window_sid) if session_opted_out(window_sid) => return Ok(()),
+            Some(_) => {}
+            None => return Ok(()),
+        },
+        SidebarScope::Sessions(ids) => match window_session_id {
+            Some(ref window_sid) if ids.contains(window_sid) => {}
             _ => return Ok(()),
-        }
+        },
+        SidebarScope::Off => return Ok(()),
     }
 
     // Find the sidebar pane ID in this window
@@ -380,7 +560,7 @@ pub fn reflow(window_id: Option<&str>) -> Result<()> {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
-    let width = resolve_width_for(&config, window_w);
+    let width = effective_width_for(&config, window_w);
 
     layout_tree::reflow_after_sidebar_add(&target, &sidebar_pane_id, width);
     Ok(())
@@ -629,6 +809,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_session_id_set() {
+        let ids = parse_session_id_set("$2  $0\n$1");
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains("$0"));
+        assert!(ids.contains("$1"));
+        assert!(ids.contains("$2"));
+    }
+
+    #[test]
+    fn serializes_session_id_set_deterministically() {
+        let ids = parse_session_id_set("$2 $0 $1");
+        assert_eq!(serialize_session_id_set(&ids), "$0 $1 $2");
+    }
+
+    #[test]
     fn next_wraps_from_last_to_first() {
         assert_eq!(compute_nav_target(&NavAction::Next, Some(2), 3), Some(0));
     }
@@ -784,5 +979,37 @@ mod tests {
             compute_nav_target(&NavAction::Next, current_idx, panes.len()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn resolve_width_uses_synced_width() {
+        let config = crate::config::Config::default();
+        // Synced width of 40 in a 200-col window should return 40
+        assert_eq!(resolve_width_for(&config, 200, Some(40)), 40);
+    }
+
+    #[test]
+    fn resolve_width_clamps_synced_to_window() {
+        let config = crate::config::Config::default();
+        // Synced width of 100 in a 60-col window should clamp to 50 (60 - 10)
+        assert_eq!(resolve_width_for(&config, 60, Some(100)), 50);
+        // Synced width of 5 should clamp to minimum 10
+        assert_eq!(resolve_width_for(&config, 200, Some(5)), 10);
+    }
+
+    #[test]
+    fn resolve_width_clamps_narrow_window() {
+        let config = crate::config::Config::default();
+        // In a 25-col window, max is 15 (25 - 10), clamp 50 to [10, 15] = 15
+        assert_eq!(resolve_width_for(&config, 25, Some(50)), 15);
+    }
+
+    #[test]
+    fn resolve_width_falls_back_to_default_without_sync() {
+        let config = crate::config::Config::default();
+        // Default is 10% of window width, clamped to [25, 50]
+        assert_eq!(resolve_width_for(&config, 200, None), 25); // 10% = 20, clamped to 25
+        assert_eq!(resolve_width_for(&config, 500, None), 50); // 10% = 50, at max
+        assert_eq!(resolve_width_for(&config, 400, None), 40); // 10% = 40
     }
 }

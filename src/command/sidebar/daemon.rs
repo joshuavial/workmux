@@ -8,7 +8,8 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -846,6 +847,191 @@ fn spawn_git_worker(
     (cache, tx)
 }
 
+/// Spawn a thread that watches the global config file and per-project
+/// `.workmux.yaml` files and bumps `config_version` whenever a reload succeeds.
+///
+/// Returns a channel for the daemon main loop to send the current set of
+/// project config directories (parents of `.workmux.yaml`) to watch.
+fn spawn_config_watcher(
+    term: Arc<AtomicBool>,
+    config: Arc<Mutex<Config>>,
+    config_version: Arc<AtomicU64>,
+    dirty_flag: Arc<AtomicBool>,
+    wake_tx: mpsc::SyncSender<()>,
+) -> mpsc::Sender<HashSet<PathBuf>> {
+    let (paths_tx, paths_rx) = mpsc::channel::<HashSet<PathBuf>>();
+    thread::spawn(move || {
+        // Bounded fs event channel; on overflow force a reload.
+        let (fs_tx, fs_rx) = mpsc::sync_channel::<notify::Result<notify::Event>>(64);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let overflow_clone = overflow.clone();
+        let mut watcher: notify::RecommendedWatcher = match notify::RecommendedWatcher::new(
+            move |event: notify::Result<notify::Event>| {
+                if let Err(mpsc::TrySendError::Full(_)) = fs_tx.try_send(event) {
+                    overflow_clone.store(true, Ordering::Relaxed);
+                }
+            },
+            notify::Config::default(),
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!("config watcher unavailable: {}", e);
+                return;
+            }
+        };
+
+        // Track watched directories so we can reconcile add/remove and avoid
+        // re-watching the same path twice.
+        let mut watched_global: Option<PathBuf> = None;
+        let mut watched_project_dirs: HashSet<PathBuf> = HashSet::new();
+        let mut pending_reload_at: Option<Instant> = None;
+        let debounce = Duration::from_millis(200);
+
+        // Watch the global config dir non-recursively. Watching the parent dir
+        // (rather than the file) catches atomic-rename saves: write to a
+        // sibling temp file, then rename(temp, target). This is what vim,
+        // claude-code's Edit/Write tools, and most editors do. A direct file
+        // watch would lose the inode on rename and miss subsequent edits. It
+        // also fires on first-time creation when no config exists yet.
+        if let Some(p) = crate::config::global_config_path()
+            && let Some(dir) = p.parent()
+        {
+            match watcher.watch(dir, RecursiveMode::NonRecursive) {
+                Ok(()) => {
+                    tracing::info!(
+                        op = "watch",
+                        path = %dir.display(),
+                        kind = "global",
+                        "fd-leak debug (config)"
+                    );
+                    watched_global = Some(dir.to_path_buf());
+                }
+                Err(e) => {
+                    tracing::warn!("failed to watch global config dir {}: {}", dir.display(), e);
+                }
+            }
+        }
+
+        let interesting_basenames = ["config.yaml", "config.yml", ".workmux.yaml", ".workmux.yml"];
+
+        while !term.load(Ordering::Relaxed) {
+            // 1. Reconcile per-project watches from incoming path sets.
+            while let Ok(new_dirs) = paths_rx.try_recv() {
+                let to_remove: Vec<PathBuf> = watched_project_dirs
+                    .difference(&new_dirs)
+                    .cloned()
+                    .collect();
+                for dir in &to_remove {
+                    // Never unwatch the global config dir, even if it was
+                    // tracked under watched_project_dirs (we never issued an
+                    // OS-level watch for it from the project path; it's still
+                    // watched as the global watch).
+                    if Some(dir) == watched_global.as_ref() {
+                        watched_project_dirs.remove(dir);
+                        continue;
+                    }
+                    let res = watcher.unwatch(dir);
+                    tracing::info!(
+                        op = "unwatch",
+                        path = %dir.display(),
+                        ok = res.is_ok(),
+                        kind = "project",
+                        total = watched_project_dirs.len() - 1,
+                        "fd-leak debug (config)"
+                    );
+                    watched_project_dirs.remove(dir);
+                }
+                let to_add: Vec<PathBuf> = new_dirs
+                    .difference(&watched_project_dirs)
+                    .cloned()
+                    .collect();
+                for dir in to_add {
+                    // Skip if it's the same as the global watched dir to avoid
+                    // double-watching the same path.
+                    if Some(&dir) == watched_global.as_ref() {
+                        watched_project_dirs.insert(dir);
+                        continue;
+                    }
+                    match watcher.watch(&dir, RecursiveMode::NonRecursive) {
+                        Ok(()) => {
+                            tracing::info!(
+                                op = "watch",
+                                path = %dir.display(),
+                                kind = "project",
+                                total = watched_project_dirs.len() + 1,
+                                "fd-leak debug (config)"
+                            );
+                            watched_project_dirs.insert(dir);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "failed to watch project config dir {}: {}",
+                                dir.display(),
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+
+            // 2. Wait for the next event, capped by the pending debounce deadline.
+            let timeout = pending_reload_at
+                .map(|t| t.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|| Duration::from_millis(500));
+
+            match fs_rx.recv_timeout(timeout) {
+                Ok(Ok(event)) => {
+                    let interesting = event.paths.iter().any(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| interesting_basenames.contains(&n))
+                    });
+                    if interesting {
+                        // Lock the deadline on the FIRST event in a burst; do
+                        // not slide it forward on every subsequent event.
+                        pending_reload_at.get_or_insert(Instant::now() + debounce);
+                    }
+                }
+                Ok(Err(e)) => tracing::warn!("config watch error: {}", e),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+
+            if overflow.swap(false, Ordering::Relaxed) {
+                pending_reload_at.get_or_insert(Instant::now() + debounce);
+            }
+
+            // 3. Reload if the debounce deadline has passed.
+            if let Some(t) = pending_reload_at
+                && Instant::now() >= t
+            {
+                pending_reload_at = None;
+                // Always bump the version so clients try their own per-project
+                // load (their anchor path may differ from the daemon CWD; a
+                // failure here doesn't necessarily mean clients will fail).
+                // Only update the daemon-side cached Config on success.
+                match Config::load(None) {
+                    Ok(new_cfg) => {
+                        if let Ok(mut slot) = config.lock() {
+                            *slot = new_cfg;
+                        }
+                        tracing::debug!("daemon config reloaded");
+                    }
+                    Err(e) => {
+                        tracing::warn!("daemon-side config load failed, keeping previous: {}", e);
+                    }
+                }
+                let v = config_version.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::info!(version = v, "sidebar config_version bumped");
+                dirty_flag.store(true, Ordering::Relaxed);
+                let _ = wake_tx.try_send(());
+            }
+        }
+    });
+
+    paths_tx
+}
+
 /// Detects working agents that have stopped producing output.
 ///
 /// # Behavior
@@ -921,7 +1107,18 @@ impl InactivityTracker {
             .map(|(id, _)| id.clone())
             .collect();
         for id in &resumed {
-            self.confirmed.remove(id);
+            if let Some(confirmed_ts) = self.confirmed.remove(id) {
+                let updated_ts = working
+                    .get(id.as_str())
+                    .and_then(|a| a.updated_ts)
+                    .unwrap_or(0);
+                tracing::info!(
+                    pane_id = %id,
+                    confirmed_ts,
+                    updated_ts,
+                    "agent inactivity cleared"
+                );
+            }
             self.entries.remove(id);
         }
 
@@ -950,8 +1147,20 @@ impl InactivityTracker {
                     if prev_hash == hash && prev_rpc == current_rpc =>
                 {
                     // Same content and same RPC state: check timeout
-                    if now.duration_since(first_seen) >= self.timeout {
-                        self.confirmed.insert(pane_id.to_string(), current_rpc);
+                    let idle_for = now.duration_since(first_seen);
+                    if idle_for >= self.timeout
+                        && self
+                            .confirmed
+                            .insert(pane_id.to_string(), current_rpc)
+                            .is_none()
+                    {
+                        tracing::info!(
+                            pane_id = %pane_id,
+                            updated_ts = current_rpc,
+                            idle_for_ms = idle_for.as_millis(),
+                            timeout_ms = self.timeout.as_millis(),
+                            "agent inactivity detected"
+                        );
                     }
                 }
                 _ => {
@@ -970,8 +1179,13 @@ impl InactivityTracker {
 pub fn run() -> Result<()> {
     let mux = create_backend(detect_backend());
     let instance_id = mux.instance_id();
-    let config = Config::load(None)?;
-    let status_icons = config.status_icons.clone();
+    let config = Arc::new(Mutex::new(Config::load(None)?));
+    // Captured at startup and intentionally not live-reloaded. tmux's
+    // @workmux_pane_status holds the icon string itself; build_snapshot
+    // compares pane statuses to these exact strings to suppress stale
+    // done/waiting markers, so swapping the icons mid-run would mis-suppress.
+    let status_icons = config.lock().unwrap().status_icons.clone();
+    let config_version = Arc::new(AtomicU64::new(0));
 
     tracing::info!(instance_id = %instance_id, "sidebar daemon starting");
 
@@ -992,6 +1206,15 @@ pub fn run() -> Result<()> {
     let sock_path = socket_path(&instance_id);
     let _ = std::fs::remove_file(&sock_path); // Clean stale
     let server = SocketServer::bind(&sock_path)?;
+
+    // Config watcher: bumps config_version on global / project .workmux.yaml changes.
+    let config_paths_tx = spawn_config_watcher(
+        term.clone(),
+        config.clone(),
+        config_version.clone(),
+        dirty_flag.clone(),
+        wake_tx.clone(),
+    );
 
     // Background git status worker (shares dirty_flag for immediate broadcast on changes)
     let (git_cache, git_path_tx) = spawn_git_worker(term.clone(), dirty_flag.clone(), wake_tx);
@@ -1019,6 +1242,13 @@ pub fn run() -> Result<()> {
     let refresh_interval = Duration::from_secs(2);
     let debounce_interval = Duration::from_millis(50);
 
+    // Cache of agent_path -> project_config_dir so we don't run the walk-up
+    // filesystem search on every tick. Misses (no config found) are NOT
+    // cached, so a newly-created `.workmux.yaml` in or above an agent's path
+    // is picked up on the next tick.
+    let mut project_config_cache: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let mut last_config_dirs: HashSet<PathBuf> = HashSet::new();
+
     while !term.load(Ordering::Relaxed) {
         // Coalesce dirty signals: SIGUSR1 sets the flag, we service it once
         // per debounce interval to prevent signal floods from causing CPU storms
@@ -1041,7 +1271,10 @@ pub fn run() -> Result<()> {
                 .ok();
             let Some(agents) = agents else { continue };
 
-            let layout_mode = read_sidebar_layout_mode(&config).unwrap_or_default();
+            let layout_mode = {
+                let cfg = config.lock().unwrap();
+                read_sidebar_layout_mode(&cfg).unwrap_or_default()
+            };
             let filter_mode = read_sidebar_filter_mode();
             let sleeping_pane_ids = read_sleeping_panes();
             let git_statuses = git_cache.lock().ok().map(|c| c.clone()).unwrap_or_default();
@@ -1054,7 +1287,7 @@ pub fn run() -> Result<()> {
             let heartbeat_due = last_runtime_write.elapsed() >= Duration::from_secs(10);
 
             // ── Compute tick (no I/O) ──
-            let output = compute_tick(
+            let mut output = compute_tick(
                 TickInput {
                     agents,
                     tmux_state,
@@ -1080,7 +1313,8 @@ pub fn run() -> Result<()> {
             }
             last_interrupted = output.next_interrupted;
 
-            // ── Broadcast ──
+            // ── Stamp config version + broadcast ──
+            output.snapshot.config_version = config_version.load(Ordering::Relaxed);
             server.broadcast(&output.snapshot);
 
             // Update git worker with current agent paths and stale status
@@ -1098,6 +1332,38 @@ pub fn run() -> Result<()> {
                 })
                 .collect();
             let _ = git_path_tx.send(entries);
+
+            // Update config watcher with current project-config dirs.
+            // find_project_config does fs walks, so cache by agent path.
+            let live_paths: HashSet<PathBuf> = output
+                .snapshot
+                .agents
+                .iter()
+                .map(|a| a.path.clone())
+                .collect();
+            project_config_cache.retain(|p, _| live_paths.contains(p));
+            let mut config_dirs: HashSet<PathBuf> = HashSet::new();
+            for a in &output.snapshot.agents {
+                let dir = if let Some(d) = project_config_cache.get(&a.path) {
+                    Some(d.clone())
+                } else {
+                    let found = crate::config::find_project_config(&a.path)
+                        .ok()
+                        .flatten()
+                        .map(|loc| loc.config_dir);
+                    if let Some(ref d) = found {
+                        project_config_cache.insert(a.path.clone(), d.clone());
+                    }
+                    found
+                };
+                if let Some(d) = dir {
+                    config_dirs.insert(d);
+                }
+            }
+            if config_dirs != last_config_dirs {
+                let _ = config_paths_tx.send(config_dirs.clone());
+                last_config_dirs = config_dirs;
+            }
 
             let agent_list: String = output
                 .snapshot
@@ -1345,6 +1611,9 @@ mod tests {
             status: Some(AgentStatus::Working),
             status_ts: Some(100),
             updated_ts: Some(updated_ts),
+            window_cmd: None,
+            agent_command: None,
+            agent_kind: None,
         }
     }
 
@@ -1682,6 +1951,7 @@ mod tests {
                 window_name: None,
                 session_name: None,
                 boot_id: None,
+                agent_kind: None,
             };
             store.upsert_agent(&state).unwrap();
         }

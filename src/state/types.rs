@@ -115,6 +115,17 @@ pub struct AgentState {
     /// if this doesn't match the current server's boot_id, the server restarted.
     #[serde(default)]
     pub boot_id: Option<String>,
+
+    /// Cached agent identity (canonical profile name, e.g. "claude", "kiro-cli").
+    ///
+    /// Classified once by `crate::agent_identity::classify_agent_kind` from the
+    /// foreground command and pane title. Cached because tmux reports an
+    /// agent's `pane_current_command` as a version string ("2.1.118") or a
+    /// generic interpreter ("node", "Python") that the stem-based profile
+    /// resolver cannot identify; the title that disambiguates them drifts
+    /// over time, so we lock in the first definitive answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_kind: Option<String>,
 }
 
 impl AgentState {
@@ -133,6 +144,9 @@ impl AgentState {
             status: self.status,
             status_ts: self.status_ts,
             updated_ts: Some(self.updated_ts),
+            window_cmd: None,
+            agent_command: Some(self.command.clone()),
+            agent_kind: self.agent_kind.clone(),
         }
     }
 }
@@ -171,6 +185,10 @@ pub struct GlobalSettings {
     /// Sidebar filter mode: "none" or "session"
     #[serde(default)]
     pub sidebar_filter: Option<String>,
+
+    /// Sidebar width in columns (manual override synced across windows)
+    #[serde(default)]
+    pub sidebar_width: Option<u16>,
 }
 
 /// Tracks which pane last-done navigated to, so repeated presses cycle

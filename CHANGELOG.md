@@ -22,6 +22,47 @@ description: Release notes and version history for workmux
 
 # Changelog
 
+## v0.1.200 (2026-05-04)
+
+- Allow `workmux close` to work from inside sandboxed worktrees by forwarding the request to the host. ([#158](https://github.com/raine/workmux/issues/158))
+- Use the host workmux configuration for sandbox-launched host commands, avoiding accidental reuse of sandbox guest settings.
+
+## v0.1.199 (2026-05-04)
+
+- Keep sidebar widths synchronized across tmux windows after manual resizing and terminal resize events.
+
+## v0.1.198 (2026-05-02)
+
+- Allow `workmux sidebar --session` to hide or restore the sidebar for the current tmux session while global sidebar mode stays active.
+
+## v0.1.197 (2026-05-02)
+
+- Respect `CLAUDE_CONFIG_DIR` when installing skills, so custom Claude config locations are honored. ([#157](https://github.com/raine/workmux/issues/157))
+
+## v0.1.196 (2026-05-01)
+
+- Fix Codex status tracking so panes stay marked as working while nested subagents are still running ([#154](https://github.com/raine/workmux/issues/154))
+
+## v0.1.195 (2026-05-01)
+
+- Keep compact sidebar status icons aligned even when icons have different widths
+
+## v0.1.194 (2026-05-01)
+
+- Add `WORKMUX_DISABLE_SET_WINDOW_STATUS=1` to let nested agents skip status hook updates when launched from inside another agent pane. See the [status tracking guide](https://workmux.raine.dev/guide/status-tracking)
+
+## v0.1.191 (2026-04-30)
+
+- Allow sandbox deny-mode domains to opt in to trusted private network destinations, such as VPN-hosted package mirrors, while keeping loopback and link-local addresses blocked
+- Keep sidebar tile rows stable when template fields are empty, so optional details no longer collapse and shift tile heights unexpectedly
+
+## v0.1.190 (2026-04-29)
+
+- Add sidebar template customization, letting you choose which labels, git stats, timers, and status details appear in compact and tile layouts. See the [sidebar customization guide](https://workmux.raine.dev/guide/sidebar/customization)
+- Add customizable per-agent sidebar icons and colors, with built-in defaults for Claude, Codex, OpenCode, Gemini, Pi, Kiro, Vibe, and Copilot
+- Support tmux-style colors and attributes inside sidebar templates
+- Improve sidebar rendering for git stats, elapsed time, row highlighting, and synchronized width across windows
+
 ## v0.1.189 (2026-04-27)
 
 - Fix pi agents lingering in the dashboard after exit ([#143](https://github.com/raine/workmux/issues/143))

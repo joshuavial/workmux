@@ -1,6 +1,7 @@
 //! Filesystem-based state persistence for agent state.
 
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -70,6 +71,11 @@ impl StateStore {
         self.base_path.join("runtime")
     }
 
+    /// Path to Codex status workaround runtime directory.
+    pub(crate) fn codex_status_runtime_dir(&self) -> PathBuf {
+        self.runtime_dir().join("codex-status")
+    }
+
     /// Path to settings file.
     fn settings_path(&self) -> PathBuf {
         self.base_path.join("settings.json")
@@ -128,11 +134,17 @@ impl StateStore {
     /// No-op if the file doesn't exist.
     pub fn delete_agent(&self, key: &PaneKey) -> Result<()> {
         let path = self.agent_path(key);
-        match fs::remove_file(&path) {
+        let agent_result = match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e).context("Failed to delete agent state"),
+        };
+
+        if let Err(error) = crate::state::codex_status::clear_pane_with_store(self, key) {
+            warn!(error = %error, "failed to clear Codex status state for deleted agent");
         }
+
+        agent_result
     }
 
     /// Load global settings.
@@ -369,6 +381,11 @@ impl StateStore {
 
         // Fetch all live pane info in a single batched query
         let live_panes = mux.get_all_live_pane_info()?;
+        let auto_renamed_tmux_windows = if mux.name() == "tmux" {
+            tmux_auto_renamed_windows(&live_panes)
+        } else {
+            HashSet::new()
+        };
 
         // Get current server boot ID for crash detection
         let current_boot_id = mux.server_boot_id().unwrap_or(None);
@@ -489,6 +506,19 @@ impl StateStore {
                     if live.title.is_some() {
                         agent_pane.pane_title = live.title.clone();
                     }
+                    // Only the tmux backend can reliably distinguish auto-renamed
+                    // window names from sticky user-set ones via pane_current_command.
+                    if backend == "tmux" {
+                        if live
+                            .window
+                            .as_ref()
+                            .is_some_and(|window| auto_renamed_tmux_windows.contains(window))
+                        {
+                            agent_pane.window_cmd = live.window.clone();
+                        } else {
+                            agent_pane.window_cmd = live.current_command.clone();
+                        }
+                    }
                     valid_agents.push(agent_pane);
                 }
             }
@@ -496,6 +526,18 @@ impl StateStore {
 
         Ok(valid_agents)
     }
+}
+
+fn tmux_auto_renamed_windows(
+    live_panes: &std::collections::HashMap<String, crate::multiplexer::LivePaneInfo>,
+) -> HashSet<String> {
+    live_panes
+        .values()
+        .filter_map(|pane| match (&pane.window, &pane.current_command) {
+            (Some(window), Some(command)) if window == command => Some(window.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Write content atomically using temp file + rename.
@@ -556,7 +598,8 @@ fn read_agent_file(path: &Path) -> Result<Option<AgentState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::multiplexer::AgentStatus;
+    use crate::multiplexer::{AgentStatus, LivePaneInfo};
+    use std::collections::HashMap;
     use tempfile::TempDir;
 
     fn test_store() -> (StateStore, TempDir) {
@@ -586,6 +629,7 @@ mod tests {
             window_name: Some("wm-test".to_string()),
             session_name: Some("main".to_string()),
             boot_id: None,
+            agent_kind: None,
         }
     }
 
@@ -705,6 +749,7 @@ mod tests {
             last_done_cycle: None,
             sidebar_layout: None,
             sidebar_filter: None,
+            sidebar_width: None,
         };
 
         store.save_settings(&settings).unwrap();
@@ -866,6 +911,48 @@ mod tests {
         let other_after = store.get_agent(&other_key).unwrap().unwrap();
         assert_eq!(other_after.workdir, PathBuf::from("/repo/wt/unrelated"));
         assert_eq!(other_after.window_name.as_deref(), Some("wm-unrelated"));
+    }
+
+    #[test]
+    fn test_tmux_auto_renamed_windows_detects_focused_pane_name() {
+        let mut live_panes = HashMap::new();
+        live_panes.insert(
+            "%1".to_string(),
+            LivePaneInfo {
+                pid: Some(1),
+                current_command: Some("node".to_string()),
+                working_dir: PathBuf::from("/repo"),
+                title: None,
+                session: Some("work".to_string()),
+                window: Some("node".to_string()),
+            },
+        );
+        live_panes.insert(
+            "%2".to_string(),
+            LivePaneInfo {
+                pid: Some(2),
+                current_command: Some("python".to_string()),
+                working_dir: PathBuf::from("/repo"),
+                title: None,
+                session: Some("work".to_string()),
+                window: Some("node".to_string()),
+            },
+        );
+        live_panes.insert(
+            "%3".to_string(),
+            LivePaneInfo {
+                pid: Some(3),
+                current_command: Some("bash".to_string()),
+                working_dir: PathBuf::from("/repo"),
+                title: None,
+                session: Some("work".to_string()),
+                window: Some("user-name".to_string()),
+            },
+        );
+
+        let auto_renamed = tmux_auto_renamed_windows(&live_panes);
+        assert!(auto_renamed.contains("node"));
+        assert!(!auto_renamed.contains("user-name"));
     }
 
     #[test]

@@ -7,17 +7,23 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use crate::agent_display::{extract_project_name, extract_worktree_name};
+use crate::agent_display::{extract_project_name, extract_worktree_name, resolve_labels};
 use crate::cmd::Cmd;
-use crate::config::{Config, StatusIcons};
+use crate::config::{AgentIcons, Config, SidebarWidth, StatusIcons};
 use crate::git::GitStatus;
+use ratatui::style::Color;
+use std::collections::BTreeMap;
+use std::str::FromStr;
+use tracing::warn;
 
 use crate::multiplexer::{AgentPane, Multiplexer};
 
 use crate::ui::theme::ThemePalette;
 
 use super::snapshot::SidebarSnapshot;
+use super::template::parser::{Token, parse_line};
 
 /// Sidebar layout mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -77,6 +83,69 @@ enum SelectionMode {
     Manual,
 }
 
+/// Runtime form of `sidebar.agent_icons`: icon strings and parsed colors.
+///
+/// Built once when config loads or reloads. Color strings are parsed eagerly
+/// so the render path does no string parsing per row per frame, and invalid
+/// colors warn once at load time instead of being silently ignored every
+/// render.
+///
+/// The `colors` map distinguishes:
+///   - `Some(Some(c))`: user override color.
+///   - `Some(None)`: explicit opt-out (`color: ''`); skip the
+///     `AgentKind::default_color` fallback.
+///   - kind missing from map: no override, fall through to default.
+#[derive(Debug, Default, Clone)]
+pub struct ResolvedAgentIcons {
+    pub icons: BTreeMap<String, String>,
+    pub colors: BTreeMap<String, Option<Color>>,
+}
+
+impl ResolvedAgentIcons {
+    pub fn from_config(map: Option<&AgentIcons>) -> Self {
+        let mut icons = BTreeMap::new();
+        let mut colors = BTreeMap::new();
+        let Some(map) = map else {
+            return Self { icons, colors };
+        };
+        for (kind, spec) in map {
+            if let Some(i) = spec.icon() {
+                icons.insert(kind.clone(), i.to_string());
+            }
+            if let Some(raw) = spec.color() {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    colors.insert(kind.clone(), None);
+                } else {
+                    match Color::from_str(trimmed) {
+                        Ok(c) => {
+                            colors.insert(kind.clone(), Some(c));
+                        }
+                        Err(_) => warn!(
+                            "sidebar.agent_icons.{kind}.color = {raw:?}: invalid color, ignoring"
+                        ),
+                    }
+                }
+            }
+        }
+        Self { icons, colors }
+    }
+}
+
+const DEFAULT_COMPACT_TEMPLATE: &str = "{status_icon} {primary} {pane_suffix} {fill} {elapsed}";
+const DEFAULT_TILE_TEMPLATES: &[&str] = &[
+    "{primary} {pane_suffix} {fill} {elapsed}",
+    "{secondary} {fill} {git_stats}",
+    "{pane_title}",
+];
+
+/// Parsed templates for one sidebar instance.
+#[derive(Debug, Clone)]
+pub struct ParsedTemplates {
+    pub compact: Vec<Token>,
+    pub tiles: Vec<Vec<Token>>,
+}
+
 /// Lightweight sidebar app state. No preview, git, PR, diff, or input mode.
 pub struct SidebarApp {
     pub mux: Arc<dyn Multiplexer>,
@@ -110,6 +179,30 @@ pub struct SidebarApp {
     pub sleeping_pane_ids: std::collections::HashSet<String>,
     /// Filter mode: show all agents or only those in the host tmux session.
     pub filter_mode: SidebarFilterMode,
+    /// Parsed sidebar templates.
+    pub templates: ParsedTemplates,
+    /// Per-agent icon and color overrides, parsed once at config load.
+    pub agent_icons: ResolvedAgentIcons,
+    /// Cached tile heights for hit testing (updated each render).
+    pub tile_heights: Vec<usize>,
+    /// Last `config_version` from the daemon snapshot. Increments trigger a
+    /// client-side config reload.
+    pub last_config_version: u64,
+    /// String form of the compact template currently parsed into `templates`.
+    /// Tracked so we don't re-parse on every snapshot, and so we don't retry
+    /// an unchanged broken value after logging once.
+    pub current_compact_str: String,
+    /// String forms of tile templates currently parsed into `templates`.
+    pub current_tile_strs: Vec<String>,
+    /// Live sidebar width as last loaded from config. Stored for parity with
+    /// other live keys; tmux pane resize is not driven from here.
+    pub current_width: Option<SidebarWidth>,
+    /// Last known window width (for detecting manual pane resizes).
+    last_window_width: Option<u16>,
+    /// Pending resize columns to process after debounce.
+    pending_resize_cols: Option<u16>,
+    /// Deadline after which pending resize should be processed.
+    pub(super) resize_deadline: Option<Instant>,
 }
 
 impl SidebarApp {
@@ -129,6 +222,15 @@ impl SidebarApp {
         let status_icons = config.status_icons.clone();
 
         let (host_session, host_window_id) = detect_host_window();
+
+        let templates = parse_templates(&config);
+        let (current_compact_str, current_tile_strs) = resolved_template_strings(&config);
+        let agent_icons = ResolvedAgentIcons::from_config(config.sidebar.agent_icons.as_ref());
+        let current_width = config.sidebar.width.clone();
+
+        // Seed last_window_width so the first resize event after startup grace
+        // can be compared against a baseline (fixes first-resize-dropped bug).
+        let initial_window_width = query_window_width_for_pane();
 
         Ok(Self {
             mux,
@@ -152,19 +254,24 @@ impl SidebarApp {
             interrupted_pane_ids: std::collections::HashSet::new(),
             sleeping_pane_ids: std::collections::HashSet::new(),
             filter_mode: SidebarFilterMode::default(),
+            templates,
+            agent_icons,
+            tile_heights: Vec::new(),
+            last_config_version: 0,
+            current_compact_str,
+            current_tile_strs,
+            current_width,
+            last_window_width: initial_window_width,
+            pending_resize_cols: None,
+            resize_deadline: None,
         })
     }
 
     /// Apply a snapshot received from the daemon.
     pub fn apply_snapshot(&mut self, snapshot: SidebarSnapshot) {
-        self.layout_mode = snapshot.layout_mode;
-        self.filter_mode = snapshot.filter_mode;
-        self.git_statuses = snapshot.git_statuses;
-        self.interrupted_pane_ids = snapshot.interrupted_pane_ids;
-        self.sleeping_pane_ids = snapshot.sleeping_pane_ids;
-
-        // Find host agent by window_id (stable tmux ID, survives renames).
-        // When multiple agents share a window, prefer the active pane.
+        // Compute host agent index from the new snapshot first so that a
+        // config_version bump anchors the reload to the *current* host path,
+        // not whatever was selected from the previous snapshot.
         self.host_agent_idx = self.host_window_id.as_ref().and_then(|wid| {
             let mut first_match = None;
             for (i, agent) in snapshot.agents.iter().enumerate() {
@@ -178,6 +285,17 @@ impl SidebarApp {
             }
             first_match
         });
+
+        if snapshot.config_version != self.last_config_version {
+            self.last_config_version = snapshot.config_version;
+            self.reload_config_from_disk(&snapshot);
+        }
+
+        self.layout_mode = snapshot.layout_mode;
+        self.filter_mode = snapshot.filter_mode;
+        self.git_statuses = snapshot.git_statuses;
+        self.interrupted_pane_ids = snapshot.interrupted_pane_ids;
+        self.sleeping_pane_ids = snapshot.sleeping_pane_ids;
 
         // Check if host window is active
         let was_active = self.host_window_active;
@@ -245,6 +363,43 @@ impl SidebarApp {
         if let Some(idx) = self.host_agent_idx {
             self.list_state.select(Some(idx));
         }
+    }
+
+    /// Re-read the merged config from disk and apply live-reloadable fields:
+    /// templates, agent icons, and width. Templates are anchored at the host
+    /// agent's worktree path so per-project `.workmux.yaml` overrides are
+    /// honored. On any parse error, keep the previously valid templates.
+    fn reload_config_from_disk(&mut self, snapshot: &SidebarSnapshot) {
+        let host_path = self
+            .host_agent_idx
+            .and_then(|i| snapshot.agents.get(i))
+            .map(|a| a.path.clone());
+
+        let cfg_result = match host_path.as_ref() {
+            Some(p) => Config::load_with_location_from(p, None).map(|(c, _)| c),
+            None => Config::load(None),
+        };
+        let cfg = match cfg_result {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("client config reload failed: {}", e);
+                return;
+            }
+        };
+
+        let (new_compact, new_tiles) = resolved_template_strings(&cfg);
+        if new_compact != self.current_compact_str || new_tiles != self.current_tile_strs {
+            try_reparse_templates(
+                &mut self.templates,
+                &mut self.current_compact_str,
+                &mut self.current_tile_strs,
+                &new_compact,
+                &new_tiles,
+            );
+        }
+
+        self.agent_icons = ResolvedAgentIcons::from_config(cfg.sidebar.agent_icons.as_ref());
+        self.current_width = cfg.sidebar.width.clone();
     }
 
     pub fn host_window_id(&self) -> Option<&str> {
@@ -339,7 +494,7 @@ impl SidebarApp {
             SidebarLayoutMode::Tiles => {
                 let mut y = 0;
                 for idx in offset..self.agents.len() {
-                    let h = tile_item_height(idx, self.agents.len());
+                    let h = self.tile_item_height(idx);
                     if relative_row < y + h {
                         return Some(idx);
                     }
@@ -348,6 +503,20 @@ impl SidebarApp {
                 None
             }
         }
+    }
+
+    /// Height in rows of a tile-mode item at the given index.
+    /// Uses cached heights from the last render pass.
+    fn tile_item_height(&self, idx: usize) -> usize {
+        let base = self.tile_heights.get(idx).copied().unwrap_or(3);
+        let mut h = base;
+        if idx > 0 {
+            h += 1; // top separator
+        }
+        if idx == self.agents.len() - 1 {
+            h += 1; // bottom separator
+        }
+        h
     }
 
     pub fn jump_to_selected(&mut self) {
@@ -455,63 +624,382 @@ impl SidebarApp {
         &self.window_prefix
     }
 
-    /// Display name for an agent: "project/worktree" or just "project" for main.
-    pub fn display_name(&self, agent: &AgentPane) -> String {
+    /// Record a resize event for debounced processing.
+    pub fn on_resize_event(&mut self, cols: u16) {
+        self.pending_resize_cols = Some(cols);
+        self.resize_deadline = Some(Instant::now() + Duration::from_millis(500));
+    }
+
+    /// Process any pending resize after the debounce period has elapsed.
+    /// Skips detection during startup grace period.
+    pub fn process_pending_resize(&mut self, startup: &Instant, startup_grace: Duration) {
+        if startup.elapsed() < startup_grace {
+            // Suppress detection during startup to avoid false positives from
+            // initial pane creation layout divergence.
+            self.pending_resize_cols = None;
+            self.resize_deadline = None;
+            return;
+        }
+
+        let Some(deadline) = self.resize_deadline else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+
+        let Some(pane_width) = self.pending_resize_cols else {
+            self.resize_deadline = None;
+            return;
+        };
+
+        let window_w = self.query_host_window_width();
+
+        // Store for next comparison before any potential reflow
+        let prev_window_w = self.last_window_width;
+        self.last_window_width = Some(window_w);
+        self.pending_resize_cols = None;
+        self.resize_deadline = None;
+
+        // Skip until we have a previous window width to compare against
+        let Some(prev_ww) = prev_window_w else { return };
+
+        // If window width changed, this is a terminal resize, not manual pane resize
+        if prev_ww != window_w {
+            return;
+        }
+
+        // Query the actual pane width from tmux. Crossterm's SIGWINCH-derived
+        // cols may reflect a mid-drag position (the kernel coalesces SIGWINCH
+        // signals, so a single event can fire before the drag completes). By
+        // the time the debounce fires the drag is stable, so tmux's authoritative
+        // #{pane_width} gives us the final committed width to compare against.
+        let actual_width = query_pane_width_for_pane().unwrap_or(pane_width);
+
+        let config = Config::load(None).unwrap_or_default();
+        let expected = super::effective_width_for(&config, window_w);
+
+        let delta = (actual_width as i16 - expected as i16).abs();
+
+        // If pane width differs from expected, treat as manual resize
+        if delta > 0 {
+            super::set_sidebar_width(actual_width);
+            if let Some(wid) = self.host_window_id() {
+                super::reflow_all_sidebars_except(wid);
+            }
+        }
+    }
+
+    fn query_host_window_width(&self) -> u16 {
+        query_window_width_for_pane().unwrap_or(0)
+    }
+
+    /// Resolve the (primary, secondary) label pair for an agent row.
+    ///
+    /// Strips the workmux prefix from session/window names so the resolver only
+    /// considers user-authored values. The window name is never promoted for
+    /// non-tmux backends (signaled by `window_cmd: None`).
+    pub fn resolve_agent_labels(&self, agent: &AgentPane) -> (String, String) {
         let project = extract_project_name(&agent.path);
-        let (worktree, is_main) = extract_worktree_name(
+        let (worktree, _is_main) = extract_worktree_name(
             &agent.session,
             &agent.window_name,
             &self.window_prefix,
             &agent.path,
         );
 
-        if is_main {
-            project
+        // Workmux-managed names start with the configured prefix; treat them as
+        // not user-authored by clearing them before the resolver sees them.
+        let session = if agent.session.starts_with(&self.window_prefix) {
+            ""
         } else {
-            format!("{}/{}", project, worktree)
+            agent.session.as_str()
+        };
+        let window = if agent.window_name.starts_with(&self.window_prefix) {
+            ""
+        } else {
+            agent.window_name.as_str()
+        };
+
+        resolve_labels(
+            &project,
+            session,
+            &worktree,
+            window,
+            agent.window_cmd.as_deref(),
+        )
+    }
+}
+
+/// Resolve template strings from config, falling back to defaults.
+fn resolved_template_strings(config: &Config) -> (String, Vec<String>) {
+    let compact = config
+        .sidebar
+        .templates
+        .as_ref()
+        .and_then(|t| t.compact.clone())
+        .unwrap_or_else(|| DEFAULT_COMPACT_TEMPLATE.to_string());
+    let tiles = config
+        .sidebar
+        .templates
+        .as_ref()
+        .and_then(|t| t.tiles.clone())
+        .unwrap_or_else(|| {
+            DEFAULT_TILE_TEMPLATES
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        });
+    (compact, tiles)
+}
+
+fn parse_templates(config: &Config) -> ParsedTemplates {
+    let (compact_str, tile_strs) = resolved_template_strings(config);
+
+    let compact = match parse_line(&compact_str) {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            tracing::warn!("failed to parse compact template: {}, using default", e);
+            parse_line(DEFAULT_COMPACT_TEMPLATE).expect("default template is valid")
+        }
+    };
+
+    let mut tiles = Vec::new();
+    for line in &tile_strs {
+        match parse_line(line) {
+            Ok(tokens) => tiles.push(tokens),
+            Err(e) => {
+                tracing::warn!("failed to parse tile template '{}': {}, skipping", line, e);
+            }
         }
     }
+
+    // If all tile templates failed, use defaults
+    if tiles.is_empty() {
+        tiles = DEFAULT_TILE_TEMPLATES
+            .iter()
+            .map(|s| parse_line(s).expect("default template is valid"))
+            .collect();
+    }
+
+    ParsedTemplates { compact, tiles }
 }
 
-/// Height in rows of a tile-mode ListItem at the given index.
-/// Must stay in sync with the line-building logic in `ui::render_tile_list`.
-fn tile_item_height(idx: usize, agent_count: usize) -> usize {
-    let mut h = 3; // line1 (worktree) + line2 (project) + line3 (title or empty)
-    if idx > 0 {
-        h += 1; // top separator
-    }
-    if idx == agent_count - 1 {
-        h += 1; // bottom separator
-    }
-    h
-}
-
-/// Detect this sidebar's host window using TMUX_PANE (stable, one-time).
-/// Returns (session, window_id).
-fn detect_host_window() -> (Option<String>, Option<String>) {
-    let pane_id = std::env::var("TMUX_PANE").ok().unwrap_or_default();
+/// Query the window width for the current tmux pane (standalone for use before
+/// `Self` exists).
+fn query_window_width_for_pane() -> Option<u16> {
+    let pane_id = std::env::var("TMUX_PANE").unwrap_or_default();
     let mut args = vec!["display-message", "-p"];
     if !pane_id.is_empty() {
         args.extend_from_slice(&["-t", &pane_id]);
     }
-    args.push("#{session_name}\t#{window_id}");
-    let output = Cmd::new("tmux")
+    args.push("#{window_width}");
+    Cmd::new("tmux")
         .args(&args)
         .run_and_capture_stdout()
         .ok()
-        .unwrap_or_default();
-    let trimmed = output.trim();
-    let mut parts = trimmed
-        .split('\t')
-        .map(|s| (!s.is_empty()).then(|| s.to_string()));
-    let session = parts.next().flatten();
-    let window_id = parts.next().flatten();
-    (session, window_id)
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Query the actual pane width from tmux. Used to verify the sidebar pane
+/// size after a manual resize, since crossterm's SIGWINCH-derived cols may
+/// differ from what tmux reports via #{pane_width}.
+fn query_pane_width_for_pane() -> Option<u16> {
+    let pane_id = std::env::var("TMUX_PANE").unwrap_or_default();
+    let mut args = vec!["display-message", "-p"];
+    if !pane_id.is_empty() {
+        args.extend_from_slice(&["-t", &pane_id]);
+    }
+    args.push("#{pane_width}");
+    Cmd::new("tmux")
+        .args(&args)
+        .run_and_capture_stdout()
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|&w| w > 0)
+}
+
+/// Parse new template strings, mutating `templates` and the cached strings.
+/// On any parse error, keep `templates` as-is and log a warning. The cached
+/// strings are still updated so we don't retry the same broken value on every
+/// snapshot.
+fn try_reparse_templates(
+    templates: &mut ParsedTemplates,
+    current_compact_str: &mut String,
+    current_tile_strs: &mut Vec<String>,
+    new_compact: &str,
+    new_tiles: &[String],
+) {
+    let compact_res = parse_line(new_compact);
+    let tile_results: Vec<_> = new_tiles.iter().map(|s| parse_line(s)).collect();
+
+    let mut had_error = false;
+    if let Err(e) = &compact_res {
+        tracing::warn!("compact template parse error, keeping previous: {}", e);
+        had_error = true;
+    }
+    for (i, r) in tile_results.iter().enumerate() {
+        if let Err(e) = r {
+            tracing::warn!(
+                line = i,
+                "tile template parse error, keeping previous: {}",
+                e
+            );
+            had_error = true;
+        }
+    }
+
+    if !had_error {
+        templates.compact = compact_res.expect("checked above");
+        templates.tiles = tile_results
+            .into_iter()
+            .map(|r| r.expect("checked above"))
+            .collect();
+    }
+    *current_compact_str = new_compact.to_string();
+    *current_tile_strs = new_tiles.to_vec();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AgentIconConfig, AgentIconDetails};
+
+    #[test]
+    fn resolved_icons_legacy_string() {
+        let mut map = AgentIcons::new();
+        map.insert(
+            "claude".to_string(),
+            AgentIconConfig::Plain("C".to_string()),
+        );
+        let r = ResolvedAgentIcons::from_config(Some(&map));
+        assert_eq!(r.icons.get("claude").map(String::as_str), Some("C"));
+        assert!(r.colors.is_empty());
+    }
+
+    #[test]
+    fn resolved_icons_detailed_with_valid_color() {
+        let mut map = AgentIcons::new();
+        map.insert(
+            "claude".to_string(),
+            AgentIconConfig::Detailed(AgentIconDetails {
+                icon: Some("X".to_string()),
+                color: Some("#00ff00".to_string()),
+            }),
+        );
+        let r = ResolvedAgentIcons::from_config(Some(&map));
+        assert_eq!(r.icons.get("claude").map(String::as_str), Some("X"));
+        assert_eq!(r.colors.get("claude"), Some(&Some(Color::Rgb(0, 255, 0))));
+    }
+
+    #[test]
+    fn resolved_icons_blank_color_disables_default() {
+        let mut map = AgentIcons::new();
+        map.insert(
+            "claude".to_string(),
+            AgentIconConfig::Detailed(AgentIconDetails {
+                icon: None,
+                color: Some("   ".to_string()),
+            }),
+        );
+        let r = ResolvedAgentIcons::from_config(Some(&map));
+        assert_eq!(r.colors.get("claude"), Some(&None));
+    }
+
+    #[test]
+    fn resolved_icons_invalid_color_is_dropped() {
+        let mut map = AgentIcons::new();
+        map.insert(
+            "claude".to_string(),
+            AgentIconConfig::Detailed(AgentIconDetails {
+                icon: None,
+                color: Some("not-a-color".to_string()),
+            }),
+        );
+        let r = ResolvedAgentIcons::from_config(Some(&map));
+        // No entry: lookup falls through to AgentKind::default_color at use site.
+        assert!(!r.colors.contains_key("claude"));
+    }
+
+    #[test]
+    fn resolved_icons_null_variant_is_no_op() {
+        let mut map = AgentIcons::new();
+        map.insert("claude".to_string(), AgentIconConfig::Null);
+        let r = ResolvedAgentIcons::from_config(Some(&map));
+        assert!(r.icons.is_empty());
+        assert!(r.colors.is_empty());
+    }
+
+    fn parsed_for(s: &str) -> ParsedTemplates {
+        ParsedTemplates {
+            compact: parse_line(s).unwrap(),
+            tiles: vec![parse_line(s).unwrap()],
+        }
+    }
+
+    #[test]
+    fn reparse_swaps_templates_on_change() {
+        let mut templates = parsed_for("{primary}");
+        let mut compact = "{primary}".to_string();
+        let mut tiles = vec!["{primary}".to_string()];
+
+        let new_compact = "{secondary} {fill}";
+        let new_tiles = vec!["{primary} {fill} {elapsed}".to_string()];
+        try_reparse_templates(
+            &mut templates,
+            &mut compact,
+            &mut tiles,
+            new_compact,
+            &new_tiles,
+        );
+
+        assert_eq!(compact, new_compact);
+        assert_eq!(tiles, new_tiles);
+        // 3 tokens: secondary field, literal " ", fill
+        assert_eq!(templates.compact.len(), 3);
+    }
+
+    #[test]
+    fn reparse_keeps_previous_on_compact_parse_error() {
+        let original_str = "{primary}".to_string();
+        let mut templates = parsed_for(&original_str);
+        let original_tokens = templates.compact.clone();
+        let mut compact = original_str.clone();
+        let mut tiles = vec![original_str.clone()];
+
+        let bad_compact = "{unclosed";
+        try_reparse_templates(
+            &mut templates,
+            &mut compact,
+            &mut tiles,
+            bad_compact,
+            &[original_str.clone()],
+        );
+
+        // Templates unchanged
+        assert_eq!(templates.compact, original_tokens);
+        // But cached strings updated so we don't retry the broken value
+        assert_eq!(compact, bad_compact);
+    }
+
+    #[test]
+    fn reparse_keeps_previous_on_tile_parse_error() {
+        let mut templates = parsed_for("{primary}");
+        let original_tiles = templates.tiles.clone();
+        let mut compact = "{primary}".to_string();
+        let mut tiles = vec!["{primary}".to_string()];
+
+        try_reparse_templates(
+            &mut templates,
+            &mut compact,
+            &mut tiles,
+            "{primary}",
+            &["{unknown_token}".to_string()],
+        );
+
+        assert_eq!(templates.tiles, original_tiles);
+        assert_eq!(tiles, vec!["{unknown_token}".to_string()]);
+    }
 
     #[test]
     fn filter_mode_toggle() {
@@ -555,4 +1043,27 @@ mod tests {
     fn filter_mode_default_is_session() {
         assert_eq!(SidebarFilterMode::default(), SidebarFilterMode::Session);
     }
+}
+
+/// Detect this sidebar's host window using TMUX_PANE (stable, one-time).
+/// Returns (session, window_id).
+fn detect_host_window() -> (Option<String>, Option<String>) {
+    let pane_id = std::env::var("TMUX_PANE").ok().unwrap_or_default();
+    let mut args = vec!["display-message", "-p"];
+    if !pane_id.is_empty() {
+        args.extend_from_slice(&["-t", &pane_id]);
+    }
+    args.push("#{session_name}\t#{window_id}");
+    let output = Cmd::new("tmux")
+        .args(&args)
+        .run_and_capture_stdout()
+        .ok()
+        .unwrap_or_default();
+    let trimmed = output.trim();
+    let mut parts = trimmed
+        .split('\t')
+        .map(|s| (!s.is_empty()).then(|| s.to_string()));
+    let session = parts.next().flatten();
+    let window_id = parts.next().flatten();
+    (session, window_id)
 }

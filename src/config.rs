@@ -117,6 +117,66 @@ impl DashboardConfig {
     }
 }
 
+/// Per-mode template strings for sidebar rendering.
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct TemplatesConfig {
+    /// Single-line template for compact mode.
+    pub compact: Option<String>,
+    /// Multi-line templates for tile mode (one string per line).
+    pub tiles: Option<Vec<String>>,
+}
+
+/// Detailed per-agent icon override: `{ icon, color }`.
+///
+/// `deny_unknown_fields` catches typos like `colour:` instead of silently
+/// dropping them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentIconDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
+/// Per-agent icon and color override.
+///
+/// Backwards compatible: a bare string (`claude: "C"`) parses as `Plain`.
+/// Detailed form (`claude: { icon: "C", color: "#d97757" }`) parses as
+/// `Detailed`. Bare key with no value (`claude:`) parses as `Null` and
+/// behaves like no override.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum AgentIconConfig {
+    Plain(String),
+    Detailed(AgentIconDetails),
+    Null,
+}
+
+impl AgentIconConfig {
+    /// Icon override, if any.
+    pub fn icon(&self) -> Option<&str> {
+        match self {
+            Self::Plain(s) => Some(s.as_str()),
+            Self::Detailed(d) => d.icon.as_deref(),
+            Self::Null => None,
+        }
+    }
+
+    /// Color override, if any. The string is unparsed; callers parse and
+    /// validate at config-load time.
+    pub fn color(&self) -> Option<&str> {
+        match self {
+            Self::Plain(_) | Self::Null => None,
+            Self::Detailed(d) => d.color.as_deref(),
+        }
+    }
+}
+
+/// Per-agent icon overrides. Maps agent kind (e.g. "claude", "codex") to
+/// either a bare icon string or `{ icon, color }`.
+pub type AgentIcons = BTreeMap<String, AgentIconConfig>;
+
 /// Configuration for the sidebar.
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct SidebarConfig {
@@ -127,10 +187,16 @@ pub struct SidebarConfig {
 
     /// Layout mode: "compact" or "tiles". Default: "tiles"
     pub layout: Option<String>,
+
+    /// Custom templates for sidebar rendering.
+    pub templates: Option<TemplatesConfig>,
+
+    /// Per-agent icon overrides.
+    pub agent_icons: Option<AgentIcons>,
 }
 
 /// Sidebar width: either absolute columns or a percentage of terminal width.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebarWidth {
     Absolute(u16),
     Percent(u16),
@@ -1276,6 +1342,48 @@ pub enum NetworkPolicy {
     Deny,
 }
 
+/// Detailed allowed domain rule: `{ host, allow_private_ips }`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllowedDomainDetails {
+    pub host: String,
+    #[serde(default)]
+    pub allow_private_ips: bool,
+}
+
+/// Allowed outbound HTTPS domain entry.
+///
+/// Backwards compatible: a bare string parses as a public-only rule.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum AllowedDomainEntry {
+    Plain(String),
+    Detailed(AllowedDomainDetails),
+}
+
+impl AllowedDomainEntry {
+    pub fn host(&self) -> &str {
+        match self {
+            Self::Plain(host) => host,
+            Self::Detailed(details) => &details.host,
+        }
+    }
+
+    pub fn allow_private_ips(&self) -> bool {
+        match self {
+            Self::Plain(_) => false,
+            Self::Detailed(details) => details.allow_private_ips,
+        }
+    }
+}
+
+/// Runtime form of an allowed domain rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowedDomainRule {
+    pub host: String,
+    pub allow_private_ips: bool,
+}
+
 /// Network restriction configuration for the container sandbox.
 ///
 /// When `policy` is `deny`, all outbound connections are blocked except those
@@ -1293,7 +1401,7 @@ pub struct NetworkConfig {
     /// Supports exact matches and wildcard prefixes (e.g., "*.googleapis.com").
     /// The host RPC endpoint is always allowed regardless of this list.
     #[serde(default)]
-    pub allowed_domains: Option<Vec<String>>,
+    pub allowed_domains: Option<Vec<AllowedDomainEntry>>,
 }
 
 impl NetworkConfig {
@@ -1303,14 +1411,32 @@ impl NetworkConfig {
     }
 
     /// Get the allowed domains list (empty if not set).
-    pub fn allowed_domains(&self) -> &[String] {
+    pub fn allowed_domains(&self) -> &[AllowedDomainEntry] {
         self.allowed_domains.as_deref().unwrap_or(&[])
+    }
+
+    /// Get normalized allowed domain rules.
+    pub fn allowed_domain_rules(&self) -> Vec<AllowedDomainRule> {
+        self.allowed_domains()
+            .iter()
+            .map(|entry| AllowedDomainRule {
+                host: entry.host().to_string(),
+                allow_private_ips: entry.allow_private_ips(),
+            })
+            .collect()
     }
 
     /// Validate all domain entries. Called at config load time.
     pub fn validate(&self) -> anyhow::Result<()> {
-        for domain in self.allowed_domains() {
-            validate_domain(domain)?;
+        for entry in self.allowed_domains() {
+            let host = entry.host();
+            validate_domain(host)?;
+            if entry.allow_private_ips() && host.starts_with("*.") {
+                anyhow::bail!(
+                    "allow_private_ips is only allowed for exact domains: {}",
+                    host
+                );
+            }
         }
         Ok(())
     }
@@ -1836,7 +1962,7 @@ impl Config {
             project_config,
             cli_agent,
             &defaults_root,
-        );
+        )?;
 
         debug!(
             agent = ?config.agent,
@@ -1852,7 +1978,7 @@ impl Config {
         project_config: Self,
         cli_agent: Option<&str>,
         defaults_root: &std::path::Path,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let has_explicit_agent =
             cli_agent.is_some() || project_config.agent.is_some() || global_config.agent.is_some();
 
@@ -1896,12 +2022,18 @@ impl Config {
             }
         }
 
-        // Unwrap is safe: validate only fails for invalid network config,
-        // which would have failed during deserialization already.
-        let _ = config.sandbox.network.validate();
-        let _ = config.sandbox.container.validate();
-
         config
+            .sandbox
+            .network
+            .validate()
+            .context("Invalid sandbox network config")?;
+        config
+            .sandbox
+            .container
+            .validate()
+            .context("Invalid sandbox container config")?;
+
+        Ok(config)
     }
 
     /// Load configuration from a specific path.
@@ -2104,6 +2236,21 @@ impl Config {
         merged.sidebar = SidebarConfig {
             width: project.sidebar.width.or(self.sidebar.width),
             layout: project.sidebar.layout.or(self.sidebar.layout),
+            templates: project
+                .sidebar
+                .templates
+                .clone()
+                .or(self.sidebar.templates.clone()),
+            agent_icons: match (
+                self.sidebar.agent_icons.clone(),
+                project.sidebar.agent_icons.clone(),
+            ) {
+                (Some(mut global), Some(proj)) => {
+                    global.extend(proj);
+                    Some(global)
+                }
+                (g, p) => p.or(g),
+            },
         };
 
         // Sandbox config: per-field override with nested struct merging
@@ -2666,11 +2813,98 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        Config, ContainerConfig, ContainerDevice, ExtraMount, LayoutConfig, LimaConfig,
-        NetworkConfig, NetworkPolicy, PaneConfig, SandboxConfig, SandboxRuntime, SandboxTarget,
-        SplitDirection, ToolchainMode, is_agent_command, split_first_token, validate_domain,
+        AgentIconConfig, AgentIconDetails, AllowedDomainDetails, AllowedDomainEntry, Config,
+        ContainerConfig, ContainerDevice, ExtraMount, LayoutConfig, LimaConfig, NetworkConfig,
+        NetworkPolicy, PaneConfig, SandboxConfig, SandboxRuntime, SandboxTarget, SplitDirection,
+        ToolchainMode, is_agent_command, split_first_token, validate_domain,
         validate_group_add_entry, validate_layouts_config,
     };
+
+    #[test]
+    fn agent_icon_config_parses_legacy_string() {
+        let v: AgentIconConfig = serde_yaml::from_str("\"C\"").unwrap();
+        assert_eq!(v, AgentIconConfig::Plain("C".to_string()));
+    }
+
+    #[test]
+    fn agent_icon_config_parses_detailed_with_both() {
+        let v: AgentIconConfig = serde_yaml::from_str("{ icon: \"X\", color: \"#fff\" }").unwrap();
+        assert_eq!(
+            v,
+            AgentIconConfig::Detailed(AgentIconDetails {
+                icon: Some("X".to_string()),
+                color: Some("#fff".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn agent_icon_config_parses_detailed_with_color_only() {
+        let v: AgentIconConfig = serde_yaml::from_str("{ color: red }").unwrap();
+        assert_eq!(
+            v,
+            AgentIconConfig::Detailed(AgentIconDetails {
+                icon: None,
+                color: Some("red".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn agent_icon_config_parses_empty_object_as_detailed() {
+        let v: AgentIconConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(
+            v,
+            AgentIconConfig::Detailed(AgentIconDetails {
+                icon: None,
+                color: None,
+            })
+        );
+    }
+
+    #[test]
+    fn agent_icon_config_parses_null_as_null_variant() {
+        let v: AgentIconConfig = serde_yaml::from_str("~").unwrap();
+        assert_eq!(v, AgentIconConfig::Null);
+    }
+
+    #[test]
+    fn agent_icon_config_rejects_unknown_field() {
+        let err = serde_yaml::from_str::<AgentIconConfig>("{ colour: red }");
+        assert!(err.is_err(), "expected unknown-field rejection");
+    }
+
+    #[test]
+    fn agent_icons_merge_extends_per_key() {
+        // Project key overrides global for that key; other global keys survive.
+        let yaml_global = r##"
+sidebar:
+  agent_icons:
+    claude: "C"
+    codex:
+      color: cyan
+"##;
+        let yaml_project = r##"
+sidebar:
+  agent_icons:
+    claude:
+      color: "#ff8c00"
+"##;
+        let global: Config = serde_yaml::from_str(yaml_global).unwrap();
+        let project: Config = serde_yaml::from_str(yaml_project).unwrap();
+        let merged = global.merge(project);
+        let icons = merged.sidebar.agent_icons.unwrap();
+        // codex (only in global) survives.
+        assert!(icons.contains_key("codex"));
+        // claude is replaced by the project entry (per-key replacement).
+        assert_eq!(
+            icons.get("claude"),
+            Some(&AgentIconConfig::Detailed(AgentIconDetails {
+                icon: None,
+                color: Some("#ff8c00".to_string()),
+            }))
+        );
+    }
 
     #[test]
     fn split_first_token_single_word() {
@@ -3904,7 +4138,9 @@ container:
             sandbox: SandboxConfig {
                 network: NetworkConfig {
                     policy: Some(NetworkPolicy::Deny),
-                    allowed_domains: Some(vec!["api.anthropic.com".to_string()]),
+                    allowed_domains: Some(vec![AllowedDomainEntry::Plain(
+                        "api.anthropic.com".to_string(),
+                    )]),
                 },
                 ..Default::default()
             },
@@ -3914,7 +4150,7 @@ container:
             sandbox: SandboxConfig {
                 network: NetworkConfig {
                     policy: Some(NetworkPolicy::Allow),
-                    allowed_domains: Some(vec!["evil.com".to_string()]),
+                    allowed_domains: Some(vec![AllowedDomainEntry::Plain("evil.com".to_string())]),
                 },
                 ..Default::default()
             },
@@ -3926,7 +4162,7 @@ container:
         assert_eq!(merged.sandbox.network.policy(), NetworkPolicy::Deny);
         assert_eq!(
             merged.sandbox.network.allowed_domains(),
-            &["api.anthropic.com".to_string()]
+            &[AllowedDomainEntry::Plain("api.anthropic.com".to_string())]
         );
     }
 
@@ -3937,7 +4173,7 @@ container:
             sandbox: SandboxConfig {
                 network: NetworkConfig {
                     policy: Some(NetworkPolicy::Deny),
-                    allowed_domains: Some(vec!["evil.com".to_string()]),
+                    allowed_domains: Some(vec![AllowedDomainEntry::Plain("evil.com".to_string())]),
                 },
                 ..Default::default()
             },
@@ -3955,7 +4191,9 @@ container:
             sandbox: SandboxConfig {
                 network: NetworkConfig {
                     policy: Some(NetworkPolicy::Deny),
-                    allowed_domains: Some(vec!["github.com".to_string()]),
+                    allowed_domains: Some(vec![AllowedDomainEntry::Plain(
+                        "github.com".to_string(),
+                    )]),
                 },
                 ..Default::default()
             },
@@ -3967,7 +4205,7 @@ container:
         assert_eq!(merged.sandbox.network.policy(), NetworkPolicy::Deny);
         assert_eq!(
             merged.sandbox.network.allowed_domains(),
-            &["github.com".to_string()]
+            &[AllowedDomainEntry::Plain("github.com".to_string())]
         );
     }
 
@@ -4006,7 +4244,10 @@ container:
     fn network_config_validate_catches_bad_domains() {
         let config = NetworkConfig {
             policy: Some(NetworkPolicy::Deny),
-            allowed_domains: Some(vec!["good.com".to_string(), "192.168.1.1".to_string()]),
+            allowed_domains: Some(vec![
+                AllowedDomainEntry::Plain("good.com".to_string()),
+                AllowedDomainEntry::Plain("192.168.1.1".to_string()),
+            ]),
         };
         assert!(config.validate().is_err());
     }
@@ -4016,9 +4257,9 @@ container:
         let config = NetworkConfig {
             policy: Some(NetworkPolicy::Deny),
             allowed_domains: Some(vec![
-                "api.anthropic.com".to_string(),
-                "*.github.com".to_string(),
-                "registry.npmjs.org".to_string(),
+                AllowedDomainEntry::Plain("api.anthropic.com".to_string()),
+                AllowedDomainEntry::Plain("*.github.com".to_string()),
+                AllowedDomainEntry::Plain("registry.npmjs.org".to_string()),
             ]),
         };
         assert!(config.validate().is_ok());
@@ -4036,6 +4277,90 @@ network:
         let config: SandboxConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.network.policy(), NetworkPolicy::Deny);
         assert_eq!(config.network.allowed_domains().len(), 2);
+        assert_eq!(
+            config.network.allowed_domain_rules(),
+            vec![
+                super::AllowedDomainRule {
+                    host: "api.anthropic.com".to_string(),
+                    allow_private_ips: false,
+                },
+                super::AllowedDomainRule {
+                    host: "*.github.com".to_string(),
+                    allow_private_ips: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn network_config_yaml_parses_private_domain_rule() {
+        let yaml = r#"
+network:
+  policy: deny
+  allowed_domains:
+    - host: artifactory.example.com
+      allow_private_ips: true
+"#;
+        let config: SandboxConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            config.network.allowed_domains(),
+            &[AllowedDomainEntry::Detailed(AllowedDomainDetails {
+                host: "artifactory.example.com".to_string(),
+                allow_private_ips: true,
+            })]
+        );
+    }
+
+    #[test]
+    fn network_config_yaml_rejects_unknown_allowed_domain_field() {
+        let yaml = r#"
+network:
+  policy: deny
+  allowed_domains:
+    - host: artifactory.example.com
+      alow_private: true
+"#;
+        assert!(serde_yaml::from_str::<SandboxConfig>(yaml).is_err());
+    }
+
+    #[test]
+    fn network_config_validate_rejects_wildcard_private_rule() {
+        let config = NetworkConfig {
+            policy: Some(NetworkPolicy::Deny),
+            allowed_domains: Some(vec![AllowedDomainEntry::Detailed(AllowedDomainDetails {
+                host: "*.example.com".to_string(),
+                allow_private_ips: true,
+            })]),
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("allow_private_ips"));
+    }
+
+    #[test]
+    fn network_config_load_rejects_wildcard_private_rule() {
+        let config = Config {
+            sandbox: SandboxConfig {
+                network: NetworkConfig {
+                    policy: Some(NetworkPolicy::Deny),
+                    allowed_domains: Some(vec![AllowedDomainEntry::Detailed(
+                        AllowedDomainDetails {
+                            host: "*.example.com".to_string(),
+                            allow_private_ips: true,
+                        },
+                    )]),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = Config::merge_and_apply_defaults(
+            config,
+            Config::default(),
+            None,
+            std::path::Path::new(""),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Invalid sandbox network config"));
     }
 
     // --- ContainerDevice / group_add tests ---
