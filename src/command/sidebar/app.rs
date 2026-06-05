@@ -309,7 +309,6 @@ impl SidebarApp {
             pending_resize_rows: None,
             resize_deadline: None,
             filter_mode: SidebarFilterMode::default(),
-            host_pane_cwd: None,
         }
     }
 
@@ -1367,34 +1366,6 @@ mod tests {
             })
         );
     }
-}
-
-/// Detect this sidebar's host window using TMUX_PANE (stable, one-time).
-/// Returns (session, window_id).
-fn detect_host_window() -> (Option<String>, Option<String>) {
-    let pane_id = std::env::var("TMUX_PANE").ok().unwrap_or_default();
-    let mut args = vec!["display-message", "-p"];
-    if !pane_id.is_empty() {
-        args.extend_from_slice(&["-t", &pane_id]);
-    }
-    args.push("#{session_name}\t#{window_id}");
-    let output = Cmd::new("tmux")
-        .args(&args)
-        .run_and_capture_stdout()
-        .ok()
-        .unwrap_or_default();
-    let trimmed = output.trim();
-    let mut parts = trimmed
-        .split('\t')
-        .map(|s| (!s.is_empty()).then(|| s.to_string()));
-    let session = parts.next().flatten();
-    let window_id = parts.next().flatten();
-    (session, window_id)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn filter_mode_toggle() {
@@ -1438,4 +1409,27 @@ mod tests {
     fn filter_mode_default_is_session() {
         assert_eq!(SidebarFilterMode::default(), SidebarFilterMode::Session);
     }
+}
+
+/// Detect this sidebar's host window using TMUX_PANE (stable, one-time).
+/// Returns (session, window_id).
+fn detect_host_window() -> (Option<String>, Option<String>) {
+    let pane_id = std::env::var("TMUX_PANE").ok().unwrap_or_default();
+    let mut args = vec!["display-message", "-p"];
+    if !pane_id.is_empty() {
+        args.extend_from_slice(&["-t", &pane_id]);
+    }
+    args.push("#{session_name}\t#{window_id}");
+    let output = Cmd::new("tmux")
+        .args(&args)
+        .run_and_capture_stdout()
+        .ok()
+        .unwrap_or_default();
+    let trimmed = output.trim();
+    let mut parts = trimmed
+        .split('\t')
+        .map(|s| (!s.is_empty()).then(|| s.to_string()));
+    let session = parts.next().flatten();
+    let window_id = parts.next().flatten();
+    (session, window_id)
 }

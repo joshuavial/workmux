@@ -1037,6 +1037,9 @@ mod tests {
             location: "tiles[0]".to_string(),
             message: "unknown token 'pr_status' at column 1".to_string(),
         });
+        // Isolate the template-error layout from the session filter indicator,
+        // which otherwise reserves the bottom row by default.
+        app.filter_mode = SidebarFilterMode::None;
 
         terminal.draw(|f| render_sidebar(f, &mut app)).unwrap();
 
