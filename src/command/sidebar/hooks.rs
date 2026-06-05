@@ -31,8 +31,8 @@ pub(super) fn install_hooks() -> Result<()> {
     // to match the new client).
     let reflow_cmd = format!("run-shell -b '{} _sidebar-reflow-all'", exe_str);
 
-    // Dirty signal: send SIGUSR1 to daemon on window/session/pane changes
-    let dirty_cmd = "run-shell -b 'kill -USR1 $(tmux show-option -gqv @workmux_sidebar_daemon_pid) 2>/dev/null || true'";
+    // Dirty signal: wake up the daemon's wait-for channel (avoids run-shell churn)
+    let dirty_cmd = "wait-for -S workmux_sidebar_dirty";
 
     let hooks: &[(&str, &str)] = &[
         ("after-new-window[99]", &sync_cmd),

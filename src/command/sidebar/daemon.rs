@@ -1217,7 +1217,24 @@ pub fn run() -> Result<()> {
     );
 
     // Background git status worker (shares dirty_flag for immediate broadcast on changes)
-    let (git_cache, git_path_tx) = spawn_git_worker(term.clone(), dirty_flag.clone(), wake_tx);
+    let (git_cache, git_path_tx) = spawn_git_worker(term.clone(), dirty_flag.clone(), wake_tx.clone());
+
+    // Background worker to listen for tmux wait-for wakes (replaces run-shell SIGUSR1 churn)
+    let wait_dirty_flag = dirty_flag.clone();
+    let wait_wake_tx = wake_tx.clone();
+    let wait_term = term.clone();
+    thread::spawn(move || {
+        while !wait_term.load(Ordering::Relaxed) {
+            // Blocks until `tmux wait-for -S workmux_sidebar_dirty` is executed
+            let res = Cmd::new("tmux").args(&["wait-for", "workmux_sidebar_dirty"]).run();
+            if res.is_ok() {
+                wait_dirty_flag.store(true, Ordering::Relaxed);
+                let _ = wait_wake_tx.try_send(());
+            } else {
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+    });
 
     // Store PID so toggle-off can kill us and hooks can signal us
     Cmd::new("tmux")
