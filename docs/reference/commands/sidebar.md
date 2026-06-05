@@ -5,12 +5,13 @@ description: Toggle a live agent status sidebar in tmux
 # sidebar
 
 Toggles a live agent status sidebar on the left side of all tmux windows.
-Shows all active agents across all sessions and projects with live status
-updates.
+By default, each sidebar pane shows active agents in its current tmux session
+with live status updates. Use `workmux sidebar filter none` to show agents
+across all sessions.
 
 ```bash
 workmux sidebar            # Toggle sidebar on/off (all sessions)
-workmux sidebar --session  # Toggle sidebar for current session only
+workmux sidebar --session  # Toggle current session only, or opt out of global mode
 ```
 
 ## What it shows
@@ -36,7 +37,8 @@ Each agent row displays:
 ## Navigation commands
 
 Switch between agents from any tmux pane, in the same order shown in the
-sidebar:
+sidebar. Navigation uses the same filter mode as the sidebar view, so it cycles
+within the current tmux session by default:
 
 | Command                    | Action                               |
 | -------------------------- | ------------------------------------ |
@@ -101,8 +103,11 @@ workmux sidebar --session  # Run again to disable
 You can enable session-scoped sidebars in multiple sessions independently. Each
 session can be toggled on/off without affecting others.
 
-Session-scoped and global modes cannot be mixed. Attempting to enable one while
-the other is active will show an error.
+If the global sidebar is already active, `workmux sidebar --session` hides the
+sidebar in the current tmux session only. Run it again to show the sidebar in
+that session again while other sessions remain globally managed.
+
+Starting global mode still replaces any session-scoped sidebars.
 
 ## Limitations
 

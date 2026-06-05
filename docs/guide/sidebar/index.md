@@ -23,12 +23,16 @@ Toggle the sidebar with:
 
 ```bash
 workmux sidebar            # All sessions (default)
-workmux sidebar --session  # Current session only
+workmux sidebar --session  # Current session only, or opt out of global mode
 ```
 
 By default, the sidebar appears in all existing and newly created tmux windows
 across all sessions. Use `--session` to scope it to the current session only,
 leaving other sessions untouched. Running the command again disables it.
+
+When the global sidebar is active, `workmux sidebar --session` hides it in the
+current tmux session only. Run it again to show the sidebar in that session
+again without affecting other sessions.
 
 Optionally, add a tmux binding for quick access:
 
@@ -44,6 +48,9 @@ Each agent is displayed as a tile showing:
 - Worktree name and elapsed time since last status change
 - Project name and git diff stats (committed + uncommitted lines)
 - Agent task description
+
+The exact layout, styling, and per-agent icons are fully customizable; see
+[Customization](./customization).
 
 ## Configuration
 
@@ -91,10 +98,10 @@ Click an agent tile to jump to its pane, or scroll to navigate the list. Require
 
 ### Session filter
 
-Press `s` to filter the sidebar to only show agents in the same tmux session as
-the current window. This is useful when each session maps to a project or
-workspace and you want to focus on the current one. Press `s` again to
-show all agents.
+By default, the sidebar only shows agents in the same tmux session as the
+current window. This is useful when each session maps to a project or workspace
+and you want to focus on the current one. Press `s` to show agents from all
+tmux sessions; press `s` again to return to the current session.
 
 The filter also applies to agent navigation hotkeys (`next`/`prev`/`jump`), so
 `Alt+j`/`Alt+k` will only cycle through agents in the current session.
@@ -164,8 +171,8 @@ well. It uses a daemon + client architecture with event-driven rendering:
 4. **Hooks**: tmux hooks handle lifecycle events:
    - `after-new-window` / `after-new-session`: automatically adds a sidebar pane
      to newly created windows
-   - `window-resized`: reflows the layout tree to keep the sidebar at the
-     correct width and content panes proportionally balanced
+   - `window-resized`: reflows the layout tree in every sidebar window, keeping
+     all sidebars at the correct width regardless of which window was resized
    - `after-select-window` / `client-session-changed` / `after-kill-pane`:
      signals the daemon for an immediate refresh
 
@@ -178,7 +185,7 @@ well. It uses a daemon + client architecture with event-driven rendering:
 6. **Toggle off**: kills all sidebar panes, reflows content panes to fill the
    freed space, stops the daemon, and removes hooks.
 
-## Resource usage
+### Resource usage
 
 Because tmux has no concept of a pane that persists across all windows, each
 window runs its own `_sidebar-run` process. Each one uses roughly 15 MB of

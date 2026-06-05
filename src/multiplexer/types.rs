@@ -56,6 +56,21 @@ pub struct AgentPane {
     /// Used by the inactivity tracker to detect when an agent resumes working.
     #[serde(default)]
     pub updated_ts: Option<u64>,
+    /// Foreground command of the agent's pane (e.g., "node", "zsh").
+    /// Only populated for the tmux backend; other backends pass `None` because
+    /// no equivalent signal exists for distinguishing auto-tracked window names
+    /// from user-set ones. Used by the sidebar identity resolver.
+    #[serde(default)]
+    pub window_cmd: Option<String>,
+    /// The agent command that launched this pane (e.g., "claude --verbose").
+    /// Used for agent identity classification in the sidebar.
+    #[serde(default)]
+    pub agent_command: Option<String>,
+    /// Cached agent identity (canonical profile name) classified at status-hook time.
+    /// See `crate::agent_identity::classify_agent_kind`. The sidebar consults this
+    /// before falling back to stem-based profile resolution.
+    #[serde(default)]
+    pub agent_kind: Option<String>,
 }
 
 /// Parameters for creating a new window/tab

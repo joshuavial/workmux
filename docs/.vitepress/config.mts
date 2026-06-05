@@ -31,11 +31,23 @@ export default defineConfig({
       "meta",
       { name: "algolia-site-verification", content: "3CFC51B41FBBDD13" },
     ],
-    ["meta", { property: "og:image", content: "https://workmux.raine.dev/social-preview.png" }],
+    [
+      "meta",
+      {
+        property: "og:image",
+        content: "https://workmux.raine.dev/social-preview.png",
+      },
+    ],
     ["meta", { property: "og:image:width", content: "1280" }],
     ["meta", { property: "og:image:height", content: "640" }],
     ["meta", { name: "twitter:card", content: "summary_large_image" }],
-    ["meta", { name: "twitter:image", content: "https://workmux.raine.dev/social-preview.png" }],
+    [
+      "meta",
+      {
+        name: "twitter:image",
+        content: "https://workmux.raine.dev/social-preview.png",
+      },
+    ],
   ],
 
   vite: {
@@ -96,7 +108,13 @@ export default defineConfig({
           { text: "Diff view", link: "/guide/dashboard/diff-view" },
           { text: "Patch mode", link: "/guide/dashboard/patch-mode" },
           { text: "Configuration", link: "/guide/dashboard/configuration" },
-          { text: 'Sidebar <span style="font-size:0.75em;background:var(--vp-c-green-soft);color:var(--vp-c-green-1);padding:2px 6px;border-radius:4px;margin-left:4px;vertical-align:middle;font-weight:500">New</span>', link: "/guide/dashboard/sidebar" },
+        ],
+      },
+      {
+        text: 'Sidebar <span style="font-size:0.75em;background:var(--vp-c-green-soft);color:var(--vp-c-green-1);padding:2px 6px;border-radius:4px;margin-left:4px;vertical-align:middle;font-weight:500">New</span>',
+        items: [
+          { text: "Overview", link: "/guide/sidebar/" },
+          { text: "Customization", link: "/guide/sidebar/customization" },
         ],
       },
       {
