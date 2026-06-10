@@ -30,9 +30,9 @@ mod snapshot;
 mod template;
 mod ui;
 
-use anyhow::{Result, anyhow};
 use crate::cmd::Cmd;
 use crate::config::SidebarPosition;
+use anyhow::{Result, anyhow};
 
 use self::daemon_ctrl::{ensure_daemon_running, kill_daemon, signal_daemon};
 use self::hooks::{install_hooks, remove_hooks};
@@ -258,7 +258,7 @@ fn resolve_height_for(config: &crate::config::Config, th: u16, synced_height: Op
     default.clamp(1, max_h)
 }
 
-/// Read the synced sidebar width from tmux global option, falling back to settings.
+/// Read the synced sidebar width from the live tmux global option.
 fn read_sidebar_width() -> Option<u16> {
     if let Ok(output) = Cmd::new("tmux")
         .args(&["show-option", "-gqv", "@workmux_sidebar_width"])
@@ -267,12 +267,6 @@ fn read_sidebar_width() -> Option<u16> {
         && w > 0
     {
         return Some(w);
-    }
-
-    if let Ok(store) = crate::state::StateStore::new()
-        && let Ok(settings) = store.load_settings()
-    {
-        return settings.sidebar_width;
     }
 
     None
@@ -288,50 +282,7 @@ fn read_sidebar_height() -> Option<u16> {
         return Some(h);
     }
 
-    if let Ok(store) = crate::state::StateStore::new()
-        && let Ok(settings) = store.load_settings()
-    {
-        return settings.sidebar_height;
-    }
-
     None
-}
-
-/// Set the synced sidebar width in tmux global option and persist to settings.
-fn set_sidebar_width(width: u16) {
-    let _ = Cmd::new("tmux")
-        .args(&[
-            "set-option",
-            "-g",
-            "@workmux_sidebar_width",
-            &width.to_string(),
-        ])
-        .run();
-
-    if let Ok(store) = crate::state::StateStore::new()
-        && let Ok(mut settings) = store.load_settings()
-    {
-        settings.sidebar_width = Some(width);
-        let _ = store.save_settings(&settings);
-    }
-}
-
-fn set_sidebar_height(height: u16) {
-    let _ = Cmd::new("tmux")
-        .args(&[
-            "set-option",
-            "-g",
-            "@workmux_sidebar_height",
-            &height.to_string(),
-        ])
-        .run();
-
-    if let Ok(store) = crate::state::StateStore::new()
-        && let Ok(mut settings) = store.load_settings()
-    {
-        settings.sidebar_height = Some(height);
-        let _ = store.save_settings(&settings);
-    }
 }
 
 /// Resolve effective sidebar width, checking synced width first.
@@ -356,40 +307,7 @@ fn effective_size_for(
     }
 }
 
-/// Reflow all sidebar windows except the given one.
-pub(super) fn reflow_all_sidebars_except(exclude_window_id: &str) {
-    let config = crate::config::Config::load(None).unwrap_or_default();
-    let synced = read_sidebar_width();
-    let sidebars = panes::list_sidebar_panes();
-
-    for (window_id, pane_id) in sidebars {
-        if window_id == exclude_window_id {
-            continue;
-        }
-        let position = read_sidebar_position(&config);
-        let format = match position {
-            SidebarPosition::Left => "#{window_width}",
-            SidebarPosition::Top => "#{window_height}",
-        };
-        let window_extent: u16 = Cmd::new("tmux")
-            .args(&["display-message", "-t", &window_id, "-p", format])
-            .run_and_capture_stdout()
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
-        let size = match position {
-            SidebarPosition::Left => resolve_width_for(&config, window_extent, synced),
-            SidebarPosition::Top => {
-                resolve_height_for(&config, window_extent, read_sidebar_height())
-            }
-        };
-        layout_tree::reflow_after_sidebar_add(&window_id, &pane_id, position, size);
-    }
-}
-
-/// Reflow sidebar layouts in all windows. Called by the window-resized hook
-/// so inactive windows get their sidebar widths corrected without waiting for
-/// the user to visit them.
+/// Reflow sidebar layouts in all windows for explicit repair commands.
 pub fn reflow_all() -> Result<()> {
     reflow_all_to_window_extent(None)
 }

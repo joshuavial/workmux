@@ -15,6 +15,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use crate::cmd::Cmd;
 use crate::multiplexer::{create_backend, detect_backend};
 
 use super::app::SidebarApp;
@@ -110,11 +111,7 @@ pub fn run_sidebar() -> Result<()> {
         }
 
         // Adaptive timeout: 250ms when active (for spinner), block when hidden.
-        // If a resize debounce is pending, wake early to process it.
-        let timeout = if let Some(deadline) = app.resize_deadline {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            remaining.min(Duration::from_millis(250))
-        } else if app.host_window_active() {
+        let timeout = if app.host_window_active() {
             Duration::from_millis(250)
         } else {
             // Block until a snapshot or input wakes us. Use a large timeout
@@ -126,8 +123,6 @@ pub fn run_sidebar() -> Result<()> {
         let first_event = match rx.recv_timeout(timeout) {
             Ok(ev) => Some(ev),
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Process any pending resize detection before ticking
-                app.process_pending_resize(&startup, startup_grace);
                 // Spinner tick (only fires when active, guaranteed by timeout choice)
                 if app.host_window_active() {
                     app.tick();
@@ -165,16 +160,16 @@ pub fn run_sidebar() -> Result<()> {
             );
         }
 
-        // Process any pending resize whose debounce has elapsed
-        app.process_pending_resize(&startup, startup_grace);
-
         if app.should_quit {
+            let quit_reason = app.quit_reason.as_deref().unwrap_or("unknown");
             tracing::info!(
                 host_window = ?app.host_window_id(),
-                quit_reason = app.quit_reason.as_deref().unwrap_or("unknown"),
+                quit_reason,
                 "sidebar-run quitting"
             );
-            shutdown_all_sidebars();
+            if !quit_reason.starts_with("last-pane:") {
+                shutdown_all_sidebars();
+            }
             break;
         }
     }
@@ -194,10 +189,14 @@ fn process_event(
     match event {
         AppEvent::SnapshotReady => {
             if let Some(snapshot) = snapshot_handle.take() {
-                // Check last-pane using snapshot data (with startup grace period)
+                // Check last-pane using snapshot data as a cheap hint, then
+                // confirm against live tmux state before exiting. Snapshot
+                // pane counts can be transiently incomplete while tmux is
+                // creating, killing, or reflowing panes.
                 if startup.elapsed() > startup_grace
                     && let Some(wid) = app.host_window_id()
                     && snapshot.window_pane_counts.get(wid).copied().unwrap_or(2) <= 1
+                    && live_window_pane_count(wid).is_some_and(|count| count <= 1)
                 {
                     app.quit_reason = Some(format!("last-pane: window {} has <= 1 pane", wid));
                     app.should_quit = true;
@@ -244,10 +243,22 @@ fn process_event(
             }
             *needs_render = true;
         }
-        AppEvent::Input(Event::Resize(cols, rows)) => {
-            app.on_resize_event(cols, rows);
+        AppEvent::Input(Event::Resize(_, _)) => {
             *needs_render = true;
         }
         AppEvent::Input(_) => {}
     }
+}
+
+fn live_window_pane_count(window_id: &str) -> Option<usize> {
+    Cmd::new("tmux")
+        .args(&["list-panes", "-t", window_id, "-F", "#{pane_id}"])
+        .run_and_capture_stdout()
+        .ok()
+        .map(|output| {
+            output
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        })
 }

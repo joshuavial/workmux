@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use crate::agent_display::{extract_project_name, extract_worktree_name, resolve_labels};
 use crate::cmd::Cmd;
@@ -243,16 +242,6 @@ pub struct SidebarApp {
     /// Live sidebar width as last loaded from config. Stored for parity with
     /// other live keys; tmux pane resize is not driven from here.
     pub current_width: Option<SidebarWidth>,
-    /// Last known window width (for detecting manual pane resizes).
-    last_window_width: Option<u16>,
-    /// Last known window height (for detecting manual top bar resizes).
-    last_window_height: Option<u16>,
-    /// Pending resize columns to process after debounce.
-    pending_resize_cols: Option<u16>,
-    /// Pending resize rows to process after debounce.
-    pending_resize_rows: Option<u16>,
-    /// Deadline after which pending resize should be processed.
-    pub(super) resize_deadline: Option<Instant>,
     /// Filter mode: show all agents or only those in the host tmux session.
     pub filter_mode: SidebarFilterMode,
 }
@@ -303,11 +292,6 @@ impl SidebarApp {
             current_tile_strs: vec!["{primary}".to_string()],
             current_horizontal_strs: vec!["{primary}".to_string()],
             current_width: None,
-            last_window_width: None,
-            last_window_height: None,
-            pending_resize_cols: None,
-            pending_resize_rows: None,
-            resize_deadline: None,
             filter_mode: SidebarFilterMode::default(),
         }
     }
@@ -336,11 +320,6 @@ impl SidebarApp {
         let current_width = config.sidebar.width.clone();
         let horizontal_item_width = config.sidebar.horizontal.item_width();
         let position = super::read_sidebar_position(&config);
-
-        // Seed last_window_width so the first resize event after startup grace
-        // can be compared against a baseline (fixes first-resize-dropped bug).
-        let initial_window_width = query_window_width_for_pane();
-        let initial_window_height = query_window_height_for_pane();
 
         Ok(Self {
             mux,
@@ -378,11 +357,6 @@ impl SidebarApp {
             current_tile_strs,
             current_horizontal_strs,
             current_width,
-            last_window_width: initial_window_width,
-            last_window_height: initial_window_height,
-            pending_resize_cols: None,
-            pending_resize_rows: None,
-            resize_deadline: None,
             filter_mode: SidebarFilterMode::default(),
         })
     }
@@ -776,120 +750,6 @@ impl SidebarApp {
         &self.window_prefix
     }
 
-    /// Record a resize event for debounced manual pane resize processing.
-    pub fn on_resize_event(&mut self, cols: u16, rows: u16) {
-        match self.position {
-            SidebarPosition::Left => {
-                let window_w = self.query_host_window_width();
-                if self.last_window_width.is_some_and(|prev| prev != window_w) {
-                    self.last_window_width = Some(window_w);
-                    self.pending_resize_cols = None;
-                    self.pending_resize_rows = None;
-                    self.resize_deadline = None;
-                    let _ = super::reflow_all_to_window_extent(Some(window_w));
-                    return;
-                }
-                self.pending_resize_cols = Some(cols);
-            }
-            SidebarPosition::Top => {
-                let window_h = self.query_host_window_height();
-                if self.last_window_height.is_some_and(|prev| prev != window_h) {
-                    self.last_window_height = Some(window_h);
-                    self.pending_resize_cols = None;
-                    self.pending_resize_rows = None;
-                    self.resize_deadline = None;
-                    let _ = super::reflow_all_to_window_extent(Some(window_h));
-                    return;
-                }
-                self.pending_resize_rows = Some(rows);
-            }
-        }
-
-        self.resize_deadline = Some(Instant::now() + Duration::from_millis(500));
-    }
-
-    /// Process any pending resize after the debounce period has elapsed.
-    /// Skips detection during startup grace period.
-    pub fn process_pending_resize(&mut self, startup: &Instant, startup_grace: Duration) {
-        if startup.elapsed() < startup_grace {
-            // Suppress detection during startup to avoid false positives from
-            // initial pane creation layout divergence.
-            self.pending_resize_cols = None;
-            self.pending_resize_rows = None;
-            self.resize_deadline = None;
-            return;
-        }
-
-        let Some(deadline) = self.resize_deadline else {
-            return;
-        };
-        if Instant::now() < deadline {
-            return;
-        }
-
-        let config = Config::load(None).unwrap_or_default();
-        match self.position {
-            SidebarPosition::Left => {
-                let Some(pane_width) = self.pending_resize_cols else {
-                    self.resize_deadline = None;
-                    return;
-                };
-                let window_w = self.query_host_window_width();
-                let prev_window_w = self.last_window_width;
-                self.last_window_width = Some(window_w);
-                self.pending_resize_cols = None;
-                self.pending_resize_rows = None;
-                self.resize_deadline = None;
-                let Some(prev_ww) = prev_window_w else { return };
-                if prev_ww != window_w {
-                    return;
-                }
-                let actual_width = query_pane_width_for_pane().unwrap_or(pane_width);
-                let expected = super::effective_width_for(&config, window_w);
-                let delta = (actual_width as i16 - expected as i16).abs();
-                if delta > 0 {
-                    super::set_sidebar_width(actual_width);
-                    if let Some(wid) = self.host_window_id() {
-                        super::reflow_all_sidebars_except(wid);
-                    }
-                }
-            }
-            SidebarPosition::Top => {
-                let Some(pane_height) = self.pending_resize_rows else {
-                    self.resize_deadline = None;
-                    return;
-                };
-                let window_h = self.query_host_window_height();
-                let prev_window_h = self.last_window_height;
-                self.last_window_height = Some(window_h);
-                self.pending_resize_cols = None;
-                self.pending_resize_rows = None;
-                self.resize_deadline = None;
-                let Some(prev_wh) = prev_window_h else { return };
-                if prev_wh != window_h {
-                    return;
-                }
-                let actual_height = query_pane_height_for_pane().unwrap_or(pane_height);
-                let expected = super::effective_height_for(&config, window_h);
-                let delta = (actual_height as i16 - expected as i16).abs();
-                if delta > 0 {
-                    super::set_sidebar_height(actual_height);
-                    if let Some(wid) = self.host_window_id() {
-                        super::reflow_all_sidebars_except(wid);
-                    }
-                }
-            }
-        }
-    }
-
-    fn query_host_window_width(&self) -> u16 {
-        query_window_width_for_pane().unwrap_or(0)
-    }
-
-    fn query_host_window_height(&self) -> u16 {
-        query_window_height_for_pane().unwrap_or(0)
-    }
-
     /// Resolve the (primary, secondary) label pair for an agent row.
     ///
     /// Strips the workmux prefix from session/window names so the resolver only
@@ -1016,62 +876,6 @@ fn parse_templates(config: &Config) -> (ParsedTemplates, Option<TemplateError>) 
         },
         first_error,
     )
-}
-
-/// Query the window width for the current tmux pane (standalone for use before
-/// `Self` exists).
-fn query_window_width_for_pane() -> Option<u16> {
-    let pane_id = std::env::var("TMUX_PANE").unwrap_or_default();
-    let mut args = vec!["display-message", "-p"];
-    if !pane_id.is_empty() {
-        args.extend_from_slice(&["-t", &pane_id]);
-    }
-    args.push("#{window_width}");
-    Cmd::new("tmux")
-        .args(&args)
-        .run_and_capture_stdout()
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-}
-
-fn query_window_height_for_pane() -> Option<u16> {
-    let pane_id = std::env::var("TMUX_PANE").unwrap_or_default();
-    let mut args = vec!["display-message", "-p"];
-    if !pane_id.is_empty() {
-        args.extend_from_slice(&["-t", &pane_id]);
-    }
-    args.push("#{window_height}");
-    Cmd::new("tmux")
-        .args(&args)
-        .run_and_capture_stdout()
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-}
-
-/// Query the actual pane width from tmux. Used to verify the sidebar pane
-/// size after a manual resize, since crossterm's SIGWINCH-derived cols may
-/// differ from what tmux reports via #{pane_width}.
-fn query_pane_width_for_pane() -> Option<u16> {
-    query_pane_extent_for_pane("#{pane_width}")
-}
-
-fn query_pane_height_for_pane() -> Option<u16> {
-    query_pane_extent_for_pane("#{pane_height}")
-}
-
-fn query_pane_extent_for_pane(format: &str) -> Option<u16> {
-    let pane_id = std::env::var("TMUX_PANE").unwrap_or_default();
-    let mut args = vec!["display-message", "-p"];
-    if !pane_id.is_empty() {
-        args.extend_from_slice(&["-t", &pane_id]);
-    }
-    args.push(format);
-    Cmd::new("tmux")
-        .args(&args)
-        .run_and_capture_stdout()
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .filter(|&extent| extent > 0)
 }
 
 /// Parse new template strings, mutating `templates` and the cached strings.
