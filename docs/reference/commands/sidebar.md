@@ -5,9 +5,9 @@ description: Toggle a live agent status sidebar in tmux
 # sidebar
 
 Toggles a live agent status sidebar on the left or top edge of all tmux
-windows. By default, each sidebar pane shows active agents in its current tmux
-session with live status updates. Use `workmux sidebar filter none` to show
-agents across all sessions.
+windows. By default, each sidebar pane shows active agents across all tmux
+sessions with live status updates. Use `workmux sidebar filter session` to show
+only agents in the current tmux session.
 
 ```bash
 workmux sidebar                 # Toggle sidebar on/off (all sessions)
@@ -45,7 +45,7 @@ chip to jump to its pane, or scroll to navigate the list.
 
 Switch between agents from any tmux pane, in the same order shown in the
 sidebar. Navigation uses the same filter mode as the sidebar view, so it cycles
-within the current tmux session by default:
+through all sessions by default:
 
 | Command                         | Action                               |
 | ------------------------------- | ------------------------------------ |

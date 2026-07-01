@@ -132,13 +132,13 @@ the list. Requires `set -g mouse on` in your `~/.tmux.conf`.
 
 ### Session filter
 
-By default, the sidebar only shows agents in the same tmux session as the
-current window. This is useful when each session maps to a project or workspace
-and you want to focus on the current one. Press `s` to show agents from all
-tmux sessions; press `s` again to return to the current session.
+By default, the sidebar shows agents across all tmux sessions. Press `s` to
+show only agents in the same tmux session as the current window; press `s` again
+to return to all sessions.
 
 The filter also applies to agent navigation hotkeys (`next`/`prev`/`jump`), so
-`Alt+j`/`Alt+k` will only cycle through agents in the current session.
+`Alt+j`/`Alt+k` cycle through the current session when the session filter is
+active.
 
 You can also toggle the filter from the command line:
 

@@ -1726,10 +1726,10 @@ Then press `prefix + Ctrl-s` to open the dashboard as a tmux popup.
 ### `workmux sidebar`
 
 Toggles a live agent status sidebar on the left or top edge of all tmux
-windows. By default, each sidebar pane shows active agents in its current tmux
-session with live status updates, providing an always-visible overview without
-taking over the full screen like the dashboard. Use `workmux sidebar filter none`
-to show agents across all sessions.
+windows. By default, each sidebar pane shows active agents across all tmux
+sessions with live status updates, providing an always-visible overview without
+taking over the full screen like the dashboard. Use `workmux sidebar filter session`
+to show only agents in the current tmux session.
 
 ```bash
 workmux sidebar                 # Toggle sidebar on/off (all sessions)
