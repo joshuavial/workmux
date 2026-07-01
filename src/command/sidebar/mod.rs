@@ -855,6 +855,25 @@ fn navigation_anchor_pane<'a>(
         .or(Some(current_pane_id).filter(|pane_id| panes.contains(pane_id)))
 }
 
+fn target_switch_command(
+    target_pane: &str,
+    current_session: &str,
+    pane_session_ids: &std::collections::HashMap<String, String>,
+    pane_window_ids: &std::collections::HashMap<String, String>,
+) -> (&'static str, Vec<String>) {
+    let target_session = pane_session_ids.get(target_pane).map(String::as_str);
+    if target_session.is_some_and(|session| session == current_session)
+        && let Some(target_window_id) = pane_window_ids.get(target_pane)
+    {
+        return (
+            "select-window-select-pane",
+            vec![target_window_id.clone(), target_pane.to_string()],
+        );
+    }
+
+    ("switch-client", vec![target_pane.to_string()])
+}
+
 /// Navigate to an agent by reading the daemon's ordered agent list from tmux.
 /// Respects the sidebar filter mode: when set to "session", only navigates
 /// among agents in the current tmux session.
@@ -893,14 +912,14 @@ pub fn navigate(action: NavAction) -> Result<()> {
     let current_window_id = current_window_id.trim();
     let pane_window_ids = pane_window_ids();
     let pane_session_ids = pane_session_ids();
+    let current_session = Cmd::new("tmux")
+        .args(&["display-message", "-p", "#{session_name}"])
+        .run_and_capture_stdout()
+        .unwrap_or_default();
+    let current_session = current_session.trim();
 
     // Apply session filter if active.
     if read_sidebar_filter_mode() == app::SidebarFilterMode::Session {
-        let current_session = Cmd::new("tmux")
-            .args(&["display-message", "-p", "#{session_name}"])
-            .run_and_capture_stdout()
-            .unwrap_or_default();
-        let current_session = current_session.trim();
         panes.retain(|pane_id| {
             pane_session_ids
                 .get(*pane_id)
@@ -926,14 +945,24 @@ pub fn navigate(action: NavAction) -> Result<()> {
     };
 
     let target_pane = panes[target_idx];
-    if let Some(target_window_id) = pane_window_ids.get(target_pane) {
+    let (command, args) = target_switch_command(
+        target_pane,
+        current_session,
+        &pane_session_ids,
+        &pane_window_ids,
+    );
+    if command == "select-window-select-pane" {
         Cmd::new("tmux")
-            .args(&["select-window", "-t", target_window_id])
+            .args(&["select-window", "-t", &args[0]])
+            .run()?;
+        Cmd::new("tmux")
+            .args(&["select-pane", "-t", &args[1]])
+            .run()?;
+    } else {
+        Cmd::new("tmux")
+            .args(&["switch-client", "-t", &args[0]])
             .run()?;
     }
-    Cmd::new("tmux")
-        .args(&["select-pane", "-t", target_pane])
-        .run()?;
 
     signal_daemon();
     Ok(())
@@ -1125,6 +1154,55 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.sidebar.width = Some(crate::config::SidebarWidth::Absolute(80));
         assert_eq!(resolve_width_for(&config, 100, None), 80);
+    }
+
+    #[test]
+    fn target_switch_uses_select_window_inside_current_session() {
+        let pane_session_ids = std::collections::HashMap::from([
+            ("%1".to_string(), "work".to_string()),
+            ("%2".to_string(), "other".to_string()),
+        ]);
+        let pane_window_ids = std::collections::HashMap::from([
+            ("%1".to_string(), "@10".to_string()),
+            ("%2".to_string(), "@20".to_string()),
+        ]);
+
+        assert_eq!(
+            target_switch_command("%1", "work", &pane_session_ids, &pane_window_ids),
+            (
+                "select-window-select-pane",
+                vec!["@10".to_string(), "%1".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn target_switch_uses_switch_client_across_sessions() {
+        let pane_session_ids = std::collections::HashMap::from([
+            ("%1".to_string(), "work".to_string()),
+            ("%2".to_string(), "other".to_string()),
+        ]);
+        let pane_window_ids = std::collections::HashMap::from([
+            ("%1".to_string(), "@10".to_string()),
+            ("%2".to_string(), "@20".to_string()),
+        ]);
+
+        assert_eq!(
+            target_switch_command("%2", "work", &pane_session_ids, &pane_window_ids),
+            ("switch-client", vec!["%2".to_string()])
+        );
+    }
+
+    #[test]
+    fn target_switch_uses_switch_client_when_session_lookup_is_missing() {
+        let pane_session_ids = std::collections::HashMap::new();
+        let pane_window_ids =
+            std::collections::HashMap::from([("%1".to_string(), "@10".to_string())]);
+
+        assert_eq!(
+            target_switch_command("%1", "work", &pane_session_ids, &pane_window_ids),
+            ("switch-client", vec!["%1".to_string()])
+        );
     }
 
     #[test]
