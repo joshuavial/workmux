@@ -1034,6 +1034,7 @@ mod tests {
             location: "tiles[0]".to_string(),
             message: "unknown token 'pr_status' at column 1".to_string(),
         });
+        app.filter_mode = super::SidebarFilterMode::None;
 
         terminal.draw(|f| render_sidebar(f, &mut app)).unwrap();
 

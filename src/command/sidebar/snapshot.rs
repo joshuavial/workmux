@@ -207,6 +207,7 @@ mod tests {
             HashMap::new(),
             SidebarPosition::Left,
             SidebarLayoutMode::default(),
+            SidebarFilterMode::default(),
             &StatusIcons::default(),
             git_statuses,
             pr_statuses,

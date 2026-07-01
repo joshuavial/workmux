@@ -12,10 +12,10 @@ use crate::config::SandboxRuntime;
 
 fn is_shell_command(command: &str) -> bool {
     let token = crate::multiplexer::agent::find_executable_token(command);
-    let stem = Path::new(token)
+    let stem = Path::new(&token)
         .file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or(token);
+        .unwrap_or(token.as_str());
 
     matches!(
         stem,

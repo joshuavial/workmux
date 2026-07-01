@@ -1404,7 +1404,7 @@ fn detect_host_window() -> (Option<String>, Option<String>) {
 }
 
 #[cfg(test)]
-mod tests {
+mod filter_tests {
     use super::*;
 
     #[test]

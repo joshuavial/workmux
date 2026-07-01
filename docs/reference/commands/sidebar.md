@@ -47,13 +47,13 @@ Switch between agents from any tmux pane, in the same order shown in the
 sidebar. Navigation uses the same filter mode as the sidebar view, so it cycles
 within the current tmux session by default:
 
-| Command                    | Action                               |
-| -------------------------- | ------------------------------------ |
-| `workmux sidebar next`            | Switch to the next agent (wraps)              |
-| `workmux sidebar prev`            | Switch to the previous agent (wraps)          |
-| `workmux sidebar jump <N>`        | Jump to the Nth agent (1-indexed)             |
-| `workmux sidebar filter`          | Toggle session filter (none/session)          |
-| `workmux sidebar filter <MODE>`   | Set filter mode: `none` or `session`          |
+| Command                         | Action                               |
+| ------------------------------- | ------------------------------------ |
+| `workmux sidebar next`          | Switch to the next agent (wraps)     |
+| `workmux sidebar prev`          | Switch to the previous agent (wraps) |
+| `workmux sidebar jump <N>`      | Jump to the Nth agent (1-indexed)    |
+| `workmux sidebar filter`        | Toggle session filter (none/session) |
+| `workmux sidebar filter <MODE>` | Set filter mode: `none` or `session` |
 
 ### Example tmux keybindings
 
