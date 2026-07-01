@@ -1749,7 +1749,7 @@ The sidebar displays:
 | `Enter` | Jump to agent         |
 | `g`/`G` | Jump to first/last    |
 | `v`     | Toggle layout mode    |
-| `s`     | Toggle session filter |
+| `f`     | Toggle session filter |
 | `q`     | Quit sidebar          |
 
 With tmux mouse mode enabled (`set -g mouse on`), click an agent row or top-bar

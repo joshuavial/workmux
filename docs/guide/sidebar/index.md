@@ -126,14 +126,14 @@ the list. Requires `set -g mouse on` in your `~/.tmux.conf`.
 | `Enter` | Jump to agent pane       |
 | `g`/`G` | Jump to first/last       |
 | `v`     | Toggle layout mode       |
-| `s`     | Toggle session filter    |
+| `f`     | Toggle session filter    |
 | `z`     | Toggle sleeping on agent |
 | `q`     | Quit sidebar             |
 
 ### Session filter
 
-By default, the sidebar shows agents across all tmux sessions. Press `s` to
-show only agents in the same tmux session as the current window; press `s` again
+By default, the sidebar shows agents across all tmux sessions. Press `f` to
+show only agents in the same tmux session as the current window; press `f` again
 to return to all sessions.
 
 The filter also applies to agent navigation hotkeys (`next`/`prev`/`jump`), so

@@ -32,7 +32,7 @@ mod ui;
 
 use crate::cmd::Cmd;
 use crate::config::SidebarPosition;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 
 use self::daemon_ctrl::{ensure_daemon_running, kill_daemon, signal_daemon};
 use self::hooks::{install_hooks, remove_hooks};
@@ -807,6 +807,14 @@ fn pane_session_ids() -> std::collections::HashMap<String, String> {
         .unwrap_or_default()
 }
 
+fn parse_sidebar_filter_mode(raw: &str) -> Result<app::SidebarFilterMode> {
+    match raw.trim().to_lowercase().as_str() {
+        "none" | "all" => Ok(app::SidebarFilterMode::None),
+        "session" | "project" => Ok(app::SidebarFilterMode::Session),
+        other => bail!("invalid sidebar filter mode {other:?}; expected none or session"),
+    }
+}
+
 fn read_sidebar_filter_mode() -> app::SidebarFilterMode {
     if let Ok(output) = Cmd::new("tmux")
         .args(&["show-option", "-gqv", "@workmux_sidebar_filter"])
@@ -814,7 +822,7 @@ fn read_sidebar_filter_mode() -> app::SidebarFilterMode {
     {
         let trimmed = output.trim();
         if !trimmed.is_empty() {
-            return app::SidebarFilterMode::from_str(trimmed);
+            return parse_sidebar_filter_mode(trimmed).unwrap_or_default();
         }
     }
 
@@ -822,7 +830,7 @@ fn read_sidebar_filter_mode() -> app::SidebarFilterMode {
         && let Ok(settings) = store.load_settings()
         && let Some(ref mode) = settings.sidebar_filter
     {
-        return app::SidebarFilterMode::from_str(mode);
+        return parse_sidebar_filter_mode(mode).unwrap_or_default();
     }
 
     app::SidebarFilterMode::default()
@@ -853,25 +861,6 @@ fn navigation_anchor_pane<'a>(
 ) -> Option<&'a str> {
     current_listed_window_pane(panes, current_pane_id, current_window_id, pane_window_ids)
         .or(Some(current_pane_id).filter(|pane_id| panes.contains(pane_id)))
-}
-
-fn target_switch_command(
-    target_pane: &str,
-    current_session: &str,
-    pane_session_ids: &std::collections::HashMap<String, String>,
-    pane_window_ids: &std::collections::HashMap<String, String>,
-) -> (&'static str, Vec<String>) {
-    let target_session = pane_session_ids.get(target_pane).map(String::as_str);
-    if target_session.is_some_and(|session| session == current_session)
-        && let Some(target_window_id) = pane_window_ids.get(target_pane)
-    {
-        return (
-            "select-window-select-pane",
-            vec![target_window_id.clone(), target_pane.to_string()],
-        );
-    }
-
-    ("switch-client", vec![target_pane.to_string()])
 }
 
 /// Navigate to an agent by reading the daemon's ordered agent list from tmux.
@@ -945,24 +934,9 @@ pub fn navigate(action: NavAction) -> Result<()> {
     };
 
     let target_pane = panes[target_idx];
-    let (command, args) = target_switch_command(
-        target_pane,
-        current_session,
-        &pane_session_ids,
-        &pane_window_ids,
-    );
-    if command == "select-window-select-pane" {
-        Cmd::new("tmux")
-            .args(&["select-window", "-t", &args[0]])
-            .run()?;
-        Cmd::new("tmux")
-            .args(&["select-pane", "-t", &args[1]])
-            .run()?;
-    } else {
-        Cmd::new("tmux")
-            .args(&["switch-client", "-t", &args[0]])
-            .run()?;
-    }
+    Cmd::new("tmux")
+        .args(&["switch-client", "-t", target_pane])
+        .run()?;
 
     signal_daemon();
     Ok(())
@@ -970,30 +944,26 @@ pub fn navigate(action: NavAction) -> Result<()> {
 
 /// Set sidebar filter mode from CLI. Toggles if no mode is given.
 pub fn set_filter_mode(mode: Option<&str>) -> Result<()> {
-    use app::SidebarFilterMode;
-
     let new_mode = match mode {
-        Some(m) => SidebarFilterMode::from_str(m),
+        Some(m) => parse_sidebar_filter_mode(m)?,
         None => read_sidebar_filter_mode().toggle(),
     };
 
     // Write to tmux global
-    let _ = Cmd::new("tmux")
+    Cmd::new("tmux")
         .args(&[
             "set-option",
             "-g",
             "@workmux_sidebar_filter",
             new_mode.as_str(),
         ])
-        .run();
+        .run()?;
 
     // Persist to settings.json
-    if let Ok(store) = crate::state::StateStore::new()
-        && let Ok(mut settings) = store.load_settings()
-    {
-        settings.sidebar_filter = Some(new_mode.as_str().to_string());
-        let _ = store.save_settings(&settings);
-    }
+    let store = crate::state::StateStore::new()?;
+    let mut settings = store.load_settings()?;
+    settings.sidebar_filter = Some(new_mode.as_str().to_string());
+    store.save_settings(&settings)?;
 
     signal_daemon();
     Ok(())
@@ -1022,6 +992,11 @@ mod tests {
     fn serializes_session_id_set_deterministically() {
         let ids = parse_session_id_set("$2 $0 $1");
         assert_eq!(serialize_session_id_set(&ids), "$0 $1 $2");
+    }
+
+    #[test]
+    fn parse_sidebar_filter_mode_rejects_invalid_values() {
+        assert!(parse_sidebar_filter_mode("sessoin").is_err());
     }
 
     #[test]
@@ -1154,55 +1129,6 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.sidebar.width = Some(crate::config::SidebarWidth::Absolute(80));
         assert_eq!(resolve_width_for(&config, 100, None), 80);
-    }
-
-    #[test]
-    fn target_switch_uses_select_window_inside_current_session() {
-        let pane_session_ids = std::collections::HashMap::from([
-            ("%1".to_string(), "work".to_string()),
-            ("%2".to_string(), "other".to_string()),
-        ]);
-        let pane_window_ids = std::collections::HashMap::from([
-            ("%1".to_string(), "@10".to_string()),
-            ("%2".to_string(), "@20".to_string()),
-        ]);
-
-        assert_eq!(
-            target_switch_command("%1", "work", &pane_session_ids, &pane_window_ids),
-            (
-                "select-window-select-pane",
-                vec!["@10".to_string(), "%1".to_string()]
-            )
-        );
-    }
-
-    #[test]
-    fn target_switch_uses_switch_client_across_sessions() {
-        let pane_session_ids = std::collections::HashMap::from([
-            ("%1".to_string(), "work".to_string()),
-            ("%2".to_string(), "other".to_string()),
-        ]);
-        let pane_window_ids = std::collections::HashMap::from([
-            ("%1".to_string(), "@10".to_string()),
-            ("%2".to_string(), "@20".to_string()),
-        ]);
-
-        assert_eq!(
-            target_switch_command("%2", "work", &pane_session_ids, &pane_window_ids),
-            ("switch-client", vec!["%2".to_string()])
-        );
-    }
-
-    #[test]
-    fn target_switch_uses_switch_client_when_session_lookup_is_missing() {
-        let pane_session_ids = std::collections::HashMap::new();
-        let pane_window_ids =
-            std::collections::HashMap::from([("%1".to_string(), "@10".to_string())]);
-
-        assert_eq!(
-            target_switch_command("%1", "work", &pane_session_ids, &pane_window_ids),
-            ("switch-client", vec!["%1".to_string()])
-        );
     }
 
     #[test]

@@ -77,6 +77,26 @@ impl SidebarFilterMode {
     }
 }
 
+fn host_agent_index(
+    agents: &[AgentPane],
+    host_window_id: Option<&str>,
+    active_pane_ids: &std::collections::HashSet<String>,
+) -> Option<usize> {
+    host_window_id.and_then(|wid| {
+        let mut first_match = None;
+        for (i, agent) in agents.iter().enumerate() {
+            if agent.window_id != wid {
+                continue;
+            }
+            if active_pane_ids.contains(&agent.pane_id) {
+                return Some(i);
+            }
+            first_match.get_or_insert(i);
+        }
+        first_match
+    })
+}
+
 /// Whether the sidebar auto-follows its host window or the user is navigating manually.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectionMode {
@@ -401,19 +421,11 @@ impl SidebarApp {
         // Compute host agent index from the new snapshot first so that a
         // config_version bump anchors the reload to the *current* host path,
         // not whatever was selected from the previous snapshot.
-        self.host_agent_idx = self.host_window_id.as_ref().and_then(|wid| {
-            let mut first_match = None;
-            for (i, agent) in snapshot.agents.iter().enumerate() {
-                if agent.window_id != *wid {
-                    continue;
-                }
-                if snapshot.active_pane_ids.contains(&agent.pane_id) {
-                    return Some(i);
-                }
-                first_match.get_or_insert(i);
-            }
-            first_match
-        });
+        self.host_agent_idx = host_agent_index(
+            &snapshot.agents,
+            self.host_window_id.as_deref(),
+            &snapshot.active_pane_ids,
+        );
 
         if snapshot.config_version != self.last_config_version {
             self.last_config_version = snapshot.config_version;
@@ -459,10 +471,11 @@ impl SidebarApp {
         {
             self.agents.retain(|a| a.session == host_session);
             // Recompute host_agent_idx after filtering
-            self.host_agent_idx = self
-                .host_window_id
-                .as_ref()
-                .and_then(|wid| self.agents.iter().position(|a| a.window_id == *wid));
+            self.host_agent_idx = host_agent_index(
+                &self.agents,
+                self.host_window_id.as_deref(),
+                &snapshot.active_pane_ids,
+            );
         }
 
         // Restore selection
@@ -760,20 +773,25 @@ impl SidebarApp {
     pub fn toggle_filter_mode(&mut self) {
         self.filter_mode = self.filter_mode.toggle();
         // Persist to tmux so all sidebar instances pick it up immediately
-        let _ = Cmd::new("tmux")
+        if let Err(error) = Cmd::new("tmux")
             .args(&[
                 "set-option",
                 "-g",
                 "@workmux_sidebar_filter",
                 self.filter_mode.as_str(),
             ])
-            .run();
-        // Persist to settings.json so it survives tmux restarts
-        if let Ok(store) = crate::state::StateStore::new()
-            && let Ok(mut settings) = store.load_settings()
+            .run()
         {
+            warn!(%error, "failed to persist sidebar filter mode to tmux");
+        }
+        // Persist to settings.json so it survives tmux restarts
+        match crate::state::StateStore::new().and_then(|store| {
+            let mut settings = store.load_settings()?;
             settings.sidebar_filter = Some(self.filter_mode.as_str().to_string());
-            let _ = store.save_settings(&settings);
+            store.save_settings(&settings)
+        }) {
+            Ok(()) => {}
+            Err(error) => warn!(%error, "failed to persist sidebar filter mode to settings"),
         }
         // Signal daemon for immediate refresh
         super::daemon_ctrl::signal_daemon();
@@ -1406,6 +1424,46 @@ fn detect_host_window() -> (Option<String>, Option<String>) {
 #[cfg(test)]
 mod filter_tests {
     use super::*;
+
+    #[test]
+    fn host_agent_index_prefers_active_pane() {
+        let agents = vec![
+            AgentPane {
+                session: "s".to_string(),
+                window_name: "w".to_string(),
+                pane_id: "%1".to_string(),
+                window_id: "@1".to_string(),
+                path: PathBuf::from("/tmp/a"),
+                pane_title: None,
+                status: None,
+                status_ts: None,
+                updated_ts: None,
+                window_cmd: None,
+                agent_command: None,
+                agent_kind: None,
+            },
+            AgentPane {
+                session: "s".to_string(),
+                window_name: "w".to_string(),
+                pane_id: "%2".to_string(),
+                window_id: "@1".to_string(),
+                path: PathBuf::from("/tmp/b"),
+                pane_title: None,
+                status: None,
+                status_ts: None,
+                updated_ts: None,
+                window_cmd: None,
+                agent_command: None,
+                agent_kind: None,
+            },
+        ];
+        let active_panes = std::collections::HashSet::from(["%2".to_string()]);
+
+        assert_eq!(
+            host_agent_index(&agents, Some("@1"), &active_panes),
+            Some(1)
+        );
+    }
 
     #[test]
     fn filter_mode_toggle() {
